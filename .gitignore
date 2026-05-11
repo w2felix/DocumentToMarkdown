@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude temp files
+scripts/claude-*-cwd
+
+# Output files
+output/
+output_patents/
+output_talks/
+figures/
+
+# Test data (PDFs, Excel)
+test_poster/
+*.pdf
+*.pptx
+*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+temp/
+
+# Backup files
+*_backup
+
+# Claude project files
+.claude/
