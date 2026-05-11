@@ -16,6 +16,8 @@ Each pipeline produces a self-contained `.md` file with YAML frontmatter, making
 
 ## Quick Start
 
+> **First time?** See the [full setup guide](setup.md) for step-by-step installation from scratch (Miniconda, packages, credentials, troubleshooting).
+
 ### 1. Setup Environment
 
 ```bash
@@ -132,9 +134,14 @@ output_talks/
 5. **Summarization** — AI generates executive summaries and key findings
 6. **Quality Scoring** — automated scoring flags documents that may need manual review
 
-## Further Reading
+## Documentation
 
-- [Setup Guide](setup.md) — full installation instructions from scratch
+| Guide | Description |
+|-------|-------------|
+| [Setup Guide](setup.md) | Full installation from scratch — Miniconda, packages, credentials, troubleshooting |
+| [Poster Pipeline](README_Posters.md) | Deep dive — architecture, processing stages, figure analysis, quality scoring |
+| [Patent Pipeline](README_Patents.md) | Deep dive — claims parsing, SMILES extraction, text quality repair, semantic classification |
+| [Talk Pipeline](README_Talks.md) | Deep dive — slide extraction, OCR pre-pass, summary generation, batch processing |
 
 ## Requirements
 

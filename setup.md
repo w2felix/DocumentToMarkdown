@@ -1,6 +1,6 @@
-# Setup Guide - Poster Processing Pipeline
+# Setup Guide
 
-Complete installation instructions from scratch.
+Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk).
 
 ---
 
@@ -45,8 +45,6 @@ python --version
 
 ## Step 3: Install Packages
 
-### Core Packages
-
 ```bash
 conda activate ds_env
 
@@ -56,17 +54,17 @@ conda install -c conda-forge pdfplumber pymupdf pillow -y
 # Data handling
 conda install pandas openpyxl -y
 
-# OCR support
+# OCR support (used by poster and talk pipelines)
 conda install -c conda-forge tesseract pytesseract -y
 
-# Anthropic API
+# Anthropic API (Claude Vision)
 pip install anthropic
 ```
 
 ### Verify Installation
 
 ```bash
-python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic; print('✓ All packages OK')"
+python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic; print('All packages OK')"
 
 tesseract --version
 # Should output: tesseract 5.x.x
@@ -74,36 +72,55 @@ tesseract --version
 
 ---
 
-## Step 4: Configure Credentials
+## Step 4: Configure API Credentials
+
+All three pipelines use the Anthropic API (Claude) for vision analysis. Set credentials as Windows User environment variables:
 
 ```powershell
 # Set authentication token (PowerShell)
 [Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN", "your-token", "User")
 
-# Set base URL (Foundry proxy)
-[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://palantir.mcloud.merckgroup.com/language-model-service/api/proxy/anthropic", "User")
+# Set base URL (e.g. corporate proxy)
+[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://your-proxy-url/api/proxy/anthropic", "User")
 
 # Verify
 [Environment]::GetEnvironmentVariable('ANTHROPIC_AUTH_TOKEN', 'User')
 [Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL', 'User')
 ```
 
-**IMPORTANT**: Restart terminal after setting variables.
+**IMPORTANT**: Restart your terminal after setting variables.
+
+Alternatively, if using the Anthropic API directly (no proxy), set `ANTHROPIC_API_KEY` instead:
+
+```powershell
+[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-...", "User")
+```
 
 ---
 
-## Step 5: Run the Pipeline
+## Step 5: Run a Pipeline
 
 ```bash
 # Navigate to project
-cd PPTXToMarkdown
+cd DocumentToMarkdown
 
 # Activate environment
 conda activate ds_env
 
 # Process posters
-python poster_pipeline.py --sharepoint "path/to/sharepoint_folder" --metadata "path/to/metadata.xlsx"
+python poster_pipeline.py --sharepoint "path/to/poster_pdfs" --metadata "abstracts.xlsx"
+
+# Process patents
+python patent_pipeline.py --input "path/to/patent_pdfs"
+
+# Process talks
+python talk_pipeline.py --talks "path/to/talk_pdfs" --metadata "abstracts.xlsx"
 ```
+
+See the [README](README.md) for full CLI options, or the pipeline-specific guides for architecture details:
+- [Poster Pipeline](README_Posters.md)
+- [Patent Pipeline](README_Patents.md)
+- [Talk Pipeline](README_Talks.md)
 
 ---
 
@@ -120,12 +137,12 @@ set PATH=%PATH%;C:\Users\YourName\miniconda3\Scripts
 ### Package Import Errors
 
 ```bash
-# Verify environment
+# Verify environment is active
 conda activate ds_env
 where python
 # Should show: C:\Users\YourName\miniconda3\envs\ds_env\python.exe
 
-# Reinstall package
+# Reinstall a package
 conda install -c conda-forge <package-name> -y
 ```
 
@@ -141,28 +158,26 @@ conda install -c conda-forge <package-name> -y
 ### API Credentials Not Working
 
 ```powershell
-# Check
+# Check current values
 [Environment]::GetEnvironmentVariable('ANTHROPIC_AUTH_TOKEN', 'User')
 
-# Set again if empty
+# Re-set if empty
 [Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN", "your-token", "User")
-[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://palantir.mcloud.merckgroup.com/language-model-service/api/proxy/anthropic", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://your-proxy-url/api/proxy/anthropic", "User")
 
-# MUST restart terminal
+# MUST restart terminal after changes
 ```
 
 ---
 
 ## Installation Checklist
 
-- ✅ Install Miniconda
-- ✅ Create `ds_env` environment (Python 3.11)
-- ✅ Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract
-- ✅ Set ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL
-- ✅ Restart terminal
-- ✅ Run pipeline: `python poster_pipeline.py --sharepoint "folder" --metadata "file.xlsx"`
-
-**You're ready!**
+- [ ] Install Miniconda
+- [ ] Create `ds_env` environment (Python 3.11)
+- [ ] Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract
+- [ ] Set `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` (or `ANTHROPIC_API_KEY`)
+- [ ] Restart terminal
+- [ ] Run a pipeline to verify everything works
 
 ---
 
@@ -171,9 +186,9 @@ conda install -c conda-forge <package-name> -y
 | Package | Purpose | Install Command |
 |---------|---------|-----------------|
 | pdfplumber | Native PDF text extraction | `conda install -c conda-forge pdfplumber` |
-| pymupdf (fitz) | PDF manipulation, rendering | `conda install -c conda-forge pymupdf` |
+| pymupdf (fitz) | PDF rendering to images | `conda install -c conda-forge pymupdf` |
 | pillow | Image processing | `conda install pillow` |
-| pandas | Data handling | `conda install pandas` |
+| pandas | Metadata handling | `conda install pandas` |
 | openpyxl | Excel file support | `conda install openpyxl` |
-| pytesseract | OCR interface | `conda install -c conda-forge pytesseract` |
-| anthropic | Claude Vision API | `pip install anthropic` |
+| pytesseract | OCR interface (Tesseract) | `conda install -c conda-forge pytesseract` |
+| anthropic | Claude Vision API client | `pip install anthropic` |
