@@ -22,7 +22,6 @@ Automated extraction and analysis of pharmaceutical/chemical patent PDFs using s
 - [Processing Log & Quality Assessment](#processing-log--quality-assessment)
 - [Performance & Scalability](#performance--scalability)
 - [Troubleshooting](#troubleshooting)
-- [Comparison with Other Pipelines](#comparison-with-other-pipelines)
 - [Known Limitations](#known-limitations)
 
 ---
@@ -665,27 +664,6 @@ If all SMILES are "low" or "medium" confidence:
 - Stage 5.5 refinement at 250 DPI should improve some structures
 - Validate critical SMILES externally with RDKit if accuracy is required
 - SMILES that fail format validation are rejected and marked accordingly
-
----
-
-## Comparison with Other Pipelines
-
-| Feature | Patent Pipeline | Poster Pipeline | Talk Pipeline |
-|---------|----------------|----------------|---------------|
-| Input format | Multi-page PDF (50-300+ pages) | Single-page PDF (vector/text) | Multi-page PDF (screenshots) |
-| Text extraction | Native pdfplumber + quality scoring + selective Vision AI | Native + OCR + Vision AI (RAG) | OCR + Vision AI only |
-| Pages per document | 50-300+ | 1-2 | 13-40+ |
-| Vision AI strategy | Selective (cover + figures + garbled text pages) | Mandatory (all pages) | Batch all pages (5/call) |
-| Text quality gate | Yes (per-page scoring, selective re-extraction) | No | No |
-| API calls per document | 10-48 | 4+N figures | 4-9 |
-| Figure handling | Batch 4 pages/call, chemistry-aware | Dedicated 2-stage analysis | Described within slide content |
-| Metadata source | Extracted from PDF itself | Excel spreadsheet | Excel spreadsheet |
-| Chemical structures | SMILES + InChI + formula + MW (two-pass with validation) | N/A | N/A |
-| Semantic classification | Yes (therapeutic_area, mechanism, target, modality, scaffold) | N/A | N/A |
-| Claims parsing | Dependency tree + AI protection scope | N/A | N/A |
-| Output structure | Section-based (patent sections) + structured tables | Section-based (Methods/Results) | Slide-based (Slide 1, 2, 3...) |
-| Processing time | ~2-3 min/patent | 1.5-4 min/poster | 1.5-4 min/talk |
-| Text-only mode | Yes (`--no-vision`) | No | No |
 
 ---
 

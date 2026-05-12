@@ -23,7 +23,6 @@ Automated extraction and analysis of scientific conference talk slides (PDF scre
 - [Processing Log & Quality Assessment](#processing-log--quality-assessment)
 - [Performance & Scalability](#performance--scalability)
 - [Troubleshooting](#troubleshooting)
-- [Comparison with Poster Pipeline](#comparison-with-poster-pipeline)
 - [Known Limitations](#known-limitations)
 
 ---
@@ -429,25 +428,6 @@ If talks score FAIR or POOR:
 - Very dark slides or low-contrast text may reduce OCR quality
 - Animated slides captured as screenshots may have overlapping content
 - Review the `processing_log.txt` for patterns
-
----
-
-## Comparison with Poster Pipeline
-
-| Feature | Talk Pipeline | Poster Pipeline |
-|---------|--------------|----------------|
-| Input format | Multi-page PDF (screenshot images) | Single-page PDF (vector/text) |
-| Text extraction | OCR + Vision AI only | Native + OCR + Vision AI (RAG) |
-| Pages per document | 13-40+ | 1-2 |
-| Processing approach | Batch slides (5/call) | Single image, multi-pass |
-| Figure handling | Described within slide content | Dedicated 2-stage analysis |
-| Metadata source | `Sheet1` sheet | `Full_Program_Copy` sheet |
-| Matching key | Speaker name + title keywords | Poster number from filename (with title-based fuzzy fallback) |
-| Abstract availability | 57% of talks | Always available (on poster) |
-| Quality dimensions | Content, OCR, Summary, Coverage, Abstract | Text, Figures, Structure, Captions |
-| Quality filtering | No (all talks saved) | Yes (FAIR/POOR skipped) |
-| Output structure | Slide-based (Slide 1, 2, 3...) | Section-based (Methods/Results/Conclusions) |
-| Processing time | 1.5-4 min/talk | 1.5-4 min/poster |
 
 ---
 

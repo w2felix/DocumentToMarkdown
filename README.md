@@ -125,6 +125,50 @@ output_talks/
 └── processing_log.txt
 ```
 
+## Pipeline Comparison
+
+### At a Glance
+
+| | Poster | Patent | Talk |
+|---|--------|--------|------|
+| **Input** | Single-page poster PDF | Multi-page patent PDF (50–300+ pages) | Multi-slide presentation PDF (screenshots) |
+| **Output** | Sections (Methods, Results, Conclusions) | Patent sections + claims + chemical data | Slide-by-slide content + narrative summary |
+| **Text extraction** | Native PDF + OCR + Vision AI | Native PDF + selective Vision AI for garbled pages | OCR + Vision AI only (no extractable text) |
+| **Metadata source** | Excel spreadsheet (required) | Extracted from the PDF itself | Excel spreadsheet (optional) |
+| **Quality gate** | Yes — skips FAIR/POOR | No — all patents saved | No — all talks saved |
+
+### Performance & Cost
+
+| | Poster | Patent | Talk |
+|---|--------|--------|------|
+| **Processing time** | 1.5–4 min | 2–3 min (text+vision), ~15s text-only | 1.5–4 min |
+| **API calls per doc** | 4 + N figures | 10–48 (scales with figure pages) | 4–9 (scales with slide count) |
+| **Token usage per doc** | ~30K–60K | ~40K–120K | ~18K–35K |
+| **Vision AI pages** | All pages (mandatory) | ~10% of pages (selective) | All slides (mandatory) |
+| **Text-only mode** | No | Yes (`--no-vision`) | No |
+| **Claims-only mode** | No | Yes (`--claims-only`, ~5s) | No |
+| **Concurrency** | Up to 5 figure workers | Up to 3 batch workers | Up to 5 batch workers |
+
+### Unique Capabilities
+
+| Capability | Poster | Patent | Talk |
+|------------|:------:|:------:|:----:|
+| Two-stage figure analysis | x | | |
+| Chemical structure extraction (SMILES) | | x | |
+| Claims dependency tree | | x | |
+| Semantic classification (target, mechanism, modality) | | x | |
+| Text quality scoring & auto-repair | | x | |
+| OCR pre-pass as RAG context | x | | x |
+| Abstract matching from metadata | x | | x |
+| Executive summary | x | x | x |
+| Quality scoring | x | x | x |
+
+### When to Use Which
+
+- **Poster** — single-page conference posters with figures, methods, and results sections
+- **Patent** — multi-page patent filings (WIPO, EPO, USPTO) with claims, chemical structures, and experimental data
+- **Talk** — slide-based presentations captured as PDF screenshots (no extractable text)
+
 ## How It Works
 
 1. **PDF Rendering** — pages are rendered to images using PyMuPDF
