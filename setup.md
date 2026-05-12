@@ -1,6 +1,6 @@
 # Setup Guide
 
-Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk).
+Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk, presentation).
 
 ---
 
@@ -57,6 +57,9 @@ conda install pandas openpyxl -y
 # OCR support (used by poster and talk pipelines)
 conda install -c conda-forge tesseract pytesseract -y
 
+# Presentation pipeline (PPTX support)
+pip install python-pptx
+
 # Anthropic API (Claude Vision)
 pip install anthropic
 ```
@@ -64,10 +67,16 @@ pip install anthropic
 ### Verify Installation
 
 ```bash
-python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic; print('All packages OK')"
+python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic, pptx; print('All packages OK')"
 
 tesseract --version
 # Should output: tesseract 5.x.x
+```
+
+Or use the provided environment check script:
+
+```bash
+python scripts/check_environment.py
 ```
 
 ---
@@ -115,12 +124,16 @@ python patent_pipeline.py --input "path/to/patent_pdfs"
 
 # Process talks
 python talk_pipeline.py --talks "path/to/talk_pdfs" --metadata "abstracts.xlsx"
+
+# Process presentations
+python presentation_pipeline.py --input "path/to/pptx_or_pdf_files"
 ```
 
 See the [README](README.md) for full CLI options, or the pipeline-specific guides for architecture details:
 - [Poster Pipeline](README_Posters.md)
 - [Patent Pipeline](README_Patents.md)
 - [Talk Pipeline](README_Talks.md)
+- [Presentation Pipeline](README_Presentations.md)
 
 ---
 
@@ -155,6 +168,12 @@ conda install -c conda-forge <package-name> -y
 # Restart terminal
 ```
 
+If Tesseract language data is missing, run the automated setup:
+
+```bash
+python scripts/setup_tessdata.py
+```
+
 ### API Credentials Not Working
 
 ```powershell
@@ -174,7 +193,7 @@ conda install -c conda-forge <package-name> -y
 
 - [ ] Install Miniconda
 - [ ] Create `ds_env` environment (Python 3.11)
-- [ ] Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract
+- [ ] Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract, python-pptx
 - [ ] Set `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` (or `ANTHROPIC_API_KEY`)
 - [ ] Restart terminal
 - [ ] Run a pipeline to verify everything works
@@ -190,5 +209,6 @@ conda install -c conda-forge <package-name> -y
 | pillow | Image processing | `conda install pillow` |
 | pandas | Metadata handling | `conda install pandas` |
 | openpyxl | Excel file support | `conda install openpyxl` |
+| python-pptx | PPTX text/table extraction | `pip install python-pptx` |
 | pytesseract | OCR interface (Tesseract) | `conda install -c conda-forge pytesseract` |
 | anthropic | Claude Vision API client | `pip install anthropic` |

@@ -52,6 +52,29 @@ temp/
 
 # Backup files
 *_backup
+*.bak
+*_backup.*
+*.backup
+
+# Secrets and credentials
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.cert
+*.crt
+credentials.*
+secrets.*
+*.secret
+config.json
+auth.json
+*.reg
+
+# API response caches
+.cache/
+api_cache/
+*.cache
 
 # Claude project files
 .claude/

@@ -27,26 +27,9 @@ from difflib import SequenceMatcher
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load credentials from Windows User environment if not in current environment
-if not os.environ.get('ANTHROPIC_AUTH_TOKEN') or not os.environ.get('ANTHROPIC_BASE_URL'):
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_READ)
-        try:
-            token, _ = winreg.QueryValueEx(key, 'ANTHROPIC_AUTH_TOKEN')
-            os.environ['ANTHROPIC_AUTH_TOKEN'] = token
-            logger.info("Loaded ANTHROPIC_AUTH_TOKEN from Windows User environment")
-        except:
-            pass
-        try:
-            url, _ = winreg.QueryValueEx(key, 'ANTHROPIC_BASE_URL')
-            os.environ['ANTHROPIC_BASE_URL'] = url
-            logger.info("Loaded ANTHROPIC_BASE_URL from Windows User environment")
-        except:
-            pass
-        winreg.CloseKey(key)
-    except:
-        pass  # Not on Windows or registry access failed
+# Load credentials from Windows User environment (with URL validation)
+from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, check_excel_safe, sanitize_filename
+load_credentials_from_registry()
 
 
 class PosterPipeline:
@@ -157,6 +140,10 @@ class PosterPipeline:
         if not self.metadata_excel.exists():
             raise FileNotFoundError(f"Excel metadata file not found: {self.metadata_excel}")
 
+        # File size safety check
+        if not check_excel_safe(self.metadata_excel):
+            raise ValueError(f"Excel file failed safety check (too large): {self.metadata_excel}")
+
         try:
             import pandas as pd
 
@@ -171,6 +158,7 @@ class PosterPipeline:
 
             if self._metadata_df.empty:
                 logger.warning("Excel metadata file is empty")
+                self._poster_lookup = {}
             else:
                 logger.info(f"✓ Excel metadata loaded: {len(self._metadata_df)} rows from sheet '{self.sheet}'")
                 available = set(self._metadata_df.columns)
@@ -180,6 +168,19 @@ class PosterPipeline:
                     missing = [n for n in names if n not in available]
                     if missing and not found:
                         logger.info(f"  Column '{role}': configured as {missing} — not in spreadsheet (will be skipped)")
+
+                # Build O(1) poster number lookup
+                self._poster_lookup = {}
+                possible_columns = self.column_map['poster_number']
+                if isinstance(possible_columns, str):
+                    possible_columns = [possible_columns]
+                for col_name in possible_columns:
+                    if col_name in self._metadata_df.columns:
+                        for idx, row in self._metadata_df.iterrows():
+                            poster_num = str(row[col_name]).strip()
+                            if poster_num and poster_num != 'nan' and poster_num not in self._poster_lookup:
+                                self._poster_lookup[poster_num] = row.to_dict()
+                logger.info(f"  Built poster lookup index: {len(self._poster_lookup)} entries")
 
         except ImportError:
             raise ImportError("pandas not installed. Install with: conda install pandas openpyxl")
@@ -2081,9 +2082,10 @@ Extracted text:
         caption_score = max(0, caption_score)
         scores['caption_quality'] = caption_score
 
-        # NEW: Figure-caption consistency check
+        # NEW: Figure-caption consistency check (count unique figure numbers, not total mentions)
         vision_figure_count = len(figures)
-        text_caption_count = len(re.findall(r'Figure\s+\d+[:\.]', text, re.IGNORECASE))
+        text_figure_numbers = set(re.findall(r'Figure\s+(\d+)[:\.]', text, re.IGNORECASE))
+        text_caption_count = len(text_figure_numbers)
 
         consistency_penalty = 0
         if vision_figure_count > 0 and text_caption_count > 0:
@@ -2718,33 +2720,28 @@ Output format:
             logger.info(f"Poster {poster_num} already processed - skipping")
             return True
 
-        # Get metadata (if available)
+        # Get metadata (if available) using O(1) lookup
         metadata_row = None
         if metadata_df is not None:
-            # Try configured column names for poster number
-            possible_columns = self.column_map['poster_number']
-            if isinstance(possible_columns, str):
-                possible_columns = [possible_columns]
-
-            matched = False
-            for col_name in possible_columns:
-                if col_name in metadata_df.columns:
-                    # Convert to string for comparison (column may contain mixed types)
-                    matches = metadata_df[metadata_df[col_name].astype(str).str.strip() == str(poster_num)]
-                    if not matches.empty:
-                        metadata_row = matches.iloc[0].to_dict()
-                        logger.info(f"✓ Found metadata for poster {poster_num} in '{col_name}' column")
-                        matched = True
-                        break
-
-            if not matched:
-                # Fallback: search all columns
-                logger.warning("⚠ Poster number column not found in known columns, searching all columns...")
-                matches = metadata_df[metadata_df.apply(lambda row: str(poster_num) in str(row.values), axis=1)]
-                if not matches.empty:
-                    metadata_row = matches.iloc[0].to_dict()
-                    logger.info(f"✓ Found metadata for poster {poster_num} (fallback search)")
+            if hasattr(self, '_poster_lookup') and self._poster_lookup:
+                metadata_row = self._poster_lookup.get(str(poster_num))
+                if metadata_row:
+                    logger.info(f"✓ Found metadata for poster {poster_num}")
                 else:
+                    logger.warning(f"⚠ Poster {poster_num} not found in metadata lookup")
+            else:
+                # Fallback if lookup wasn't built (e.g., no metadata file)
+                possible_columns = self.column_map['poster_number']
+                if isinstance(possible_columns, str):
+                    possible_columns = [possible_columns]
+                for col_name in possible_columns:
+                    if col_name in metadata_df.columns:
+                        matches = metadata_df[metadata_df[col_name].astype(str).str.strip() == str(poster_num)]
+                        if not matches.empty:
+                            metadata_row = matches.iloc[0].to_dict()
+                            logger.info(f"✓ Found metadata for poster {poster_num} in '{col_name}' column")
+                            break
+                if not metadata_row:
                     logger.warning(f"⚠ Poster {poster_num} not found in Excel metadata")
         else:
             logger.warning("⚠ No metadata DataFrame provided")
@@ -2790,8 +2787,17 @@ Output format:
             structure_future = executor.submit(self.extract_poster_structure_vision, pdf_path, encoded_image=encoded_image)
             text_future = executor.submit(_extract_base_text)
 
-            structure = structure_future.result()
-            reference_text, method = text_future.result()
+            try:
+                structure = structure_future.result()
+            except Exception as e:
+                logger.error(f"Structure extraction failed: {e}")
+                structure = {}
+
+            try:
+                reference_text, method = text_future.result()
+            except Exception as e:
+                logger.error(f"Text extraction failed: {e}")
+                return False
 
         if not reference_text or len(reference_text.strip()) == 0:
             logger.error("Failed to extract any base text (native/OCR)")
@@ -3100,6 +3106,18 @@ def main():
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Validate paths
+    try:
+        validate_path(args.sharepoint, must_exist=True, allow_dir=True, allow_file=False)
+        validate_output_path(args.output)
+        if args.metadata:
+            validate_path(args.metadata, must_exist=True, allow_file=True, allow_dir=False)
+        if args.single:
+            validate_path(args.single, must_exist=True, allow_file=True, allow_dir=False)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"Path validation failed: {e}")
+        return
 
     # Build column overrides from CLI args
     column_overrides = {}

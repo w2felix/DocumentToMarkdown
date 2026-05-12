@@ -12,6 +12,7 @@ import re
 import json
 import base64
 import argparse
+import shutil
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
@@ -22,23 +23,9 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-if not os.environ.get('ANTHROPIC_AUTH_TOKEN') or not os.environ.get('ANTHROPIC_BASE_URL'):
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_READ)
-        try:
-            token, _ = winreg.QueryValueEx(key, 'ANTHROPIC_AUTH_TOKEN')
-            os.environ['ANTHROPIC_AUTH_TOKEN'] = token
-        except:
-            pass
-        try:
-            url, _ = winreg.QueryValueEx(key, 'ANTHROPIC_BASE_URL')
-            os.environ['ANTHROPIC_BASE_URL'] = url
-        except:
-            pass
-        winreg.CloseKey(key)
-    except:
-        pass
+# Load credentials from Windows User environment (with URL validation)
+from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, check_pptx_safe, sanitize_filename
+load_credentials_from_registry()
 
 
 class PresentationPipeline:
@@ -53,6 +40,9 @@ class PresentationPipeline:
     MAX_TOKENS_SLIDE_EXTRACTION = 8192
     MAX_TOKENS_SUMMARY = 4096
     MAX_TOKENS_ANALYSIS = 4096
+
+    MAX_FILE_SIZE_MB = 500  # Reject files larger than 500MB
+    CLASSIFICATION_RANKS = {'public': 0, 'confidential': 1, 'secret': 2}
 
     SMILES_VALID_CHARS = re.compile(r'^[A-Za-z0-9@+\-\[\]()=#$/\\.%:]+$')
 
@@ -112,6 +102,14 @@ class PresentationPipeline:
         r'(?i)^backup\s+slides?\s*$',
     ]
 
+    # Pre-compiled patterns for content type classification (single-pass)
+    CONTENT_TYPE_PATTERNS = {
+        'external': re.compile(r'\b(?:partner|collaboration|alliance|joint|CRO|vendor|external|contractor|outsourc|co-develop)\b', re.IGNORECASE),
+        'academic': re.compile(r'\b(?:patient|study|trial|efficacy|endpoint|cohort|publication|abstract|poster|congress|ASCO|AACR|ESMO|hypothesis|method|results|conclusion|p[\s\-]?value)\b', re.IGNORECASE),
+        'project': re.compile(r'\b(?:compound|molecule|target|inhibitor|mechanism|discovery|preclinical|clinical|pipeline|candidate|assay|screen|SAR|selectivity|potency|IC50)\b', re.IGNORECASE),
+        'operational': re.compile(r'\b(?:update|status|progress|timeline|milestone|deliverable|team|resource|budget|plan|roadmap|strategy|meeting|review|decision|action|department)\b', re.IGNORECASE),
+    }
+
     MONTH_MAP = {
         'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
         'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
@@ -147,16 +145,24 @@ class PresentationPipeline:
                 f.write("TIMESTAMP\tFILENAME\tFORMAT\tSLIDES\tCLASSIFICATION\tCONTENT_TYPE\t"
                         "CHARS\tQUALITY\tASSESSMENT\tSTATUS\n")
 
+    @staticmethod
+    def _tsv_escape(value: str) -> str:
+        """Escape a value for safe inclusion in a TSV field."""
+        return str(value).replace('\t', ' ').replace('\n', ' ').replace('\r', '')
+
     def log_processing(self, filename: str, source_format: str, num_slides: int,
                        classification: str, content_type: str, total_chars: int,
                        quality_scores: Optional[Dict], status: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         quality = quality_scores['overall'] if quality_scores else ''
-        assessment = quality_scores['assessment'] if quality_scores else ''
-        entry = (f"{timestamp}\t{filename}\t{source_format}\t{num_slides}\t{classification}\t"
-                 f"{content_type}\t{total_chars}\t{quality}\t{assessment}\t{status}\n")
+        assessment = self._tsv_escape(quality_scores['assessment']) if quality_scores else ''
+        entry = (f"{timestamp}\t{self._tsv_escape(filename)}\t{source_format}\t{num_slides}\t"
+                 f"{classification}\t{content_type}\t{total_chars}\t{quality}\t{assessment}\t{status}\n")
         with open(self.processing_log_path, 'a', encoding='utf-8') as f:
             f.write(entry)
+
+    API_MAX_RETRIES = 3
+    API_RETRY_DELAY = 2.0  # seconds, doubled each retry
 
     def get_anthropic_client(self):
         if self._client is not None:
@@ -175,6 +181,24 @@ class PresentationPipeline:
             return None
 
         return self._client
+
+    def _api_call_with_retry(self, call_fn, description: str = "API call"):
+        """Execute an API call with exponential backoff retry on transient errors."""
+        import time
+        delay = self.API_RETRY_DELAY
+        for attempt in range(self.API_MAX_RETRIES):
+            try:
+                return call_fn()
+            except Exception as e:
+                error_str = str(e)
+                is_transient = any(s in error_str for s in ('429', '503', '529', 'timeout', 'Timeout', 'overloaded'))
+                if is_transient and attempt < self.API_MAX_RETRIES - 1:
+                    logger.warning(f"  {description} attempt {attempt + 1} failed ({error_str}), retrying in {delay:.0f}s...")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    raise
+        return None  # unreachable
 
     def list_presentation_files(self) -> List[Path]:
         files = []
@@ -238,6 +262,11 @@ class PresentationPipeline:
     def extract_pptx_content(self, pptx_path: Path) -> Dict:
         from pptx import Presentation
         from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        # Safety check: reject PPTX with macros/ActiveX
+        if not check_pptx_safe(pptx_path):
+            logger.error(f"PPTX safety check failed (macros/ActiveX detected): {pptx_path.name}")
+            return {'slides': [], 'metadata': {}, 'num_slides': 0}
 
         prs = Presentation(str(pptx_path))
 
@@ -324,7 +353,7 @@ class PresentationPipeline:
                     if notes_text and not re.match(r'^(\d+|slide\s*\d*)$', notes_text, re.IGNORECASE):
                         slide_data['notes'] = notes_text
                         has_speaker_notes = True
-            except:
+            except Exception:
                 pass
 
             all_text = ' '.join(slide_data['text_blocks'])
@@ -360,6 +389,7 @@ class PresentationPipeline:
 
         slides_data = []
         total_chars = 0
+        num_pages = 0
         garbled_pages = []
 
         try:
@@ -479,7 +509,7 @@ class PresentationPipeline:
             import fitz
             from PIL import Image
 
-            Image.MAX_IMAGE_PIXELS = None
+            Image.MAX_IMAGE_PIXELS = 300_000_000  # ~300MP, generous but bounded
             doc = fitz.open(str(pdf_path))
             images = []
             zoom = self.RENDER_DPI / 72
@@ -549,17 +579,58 @@ class PresentationPipeline:
                             if line.strip():
                                 table_content.add(line.strip())
 
+        # Pre-filter: only check substring against cells longer than the block
+        # Sort table_content by length for efficient substring checking
+        long_cells = sorted([tc for tc in table_content if len(tc) > 10], key=len, reverse=True)
+
         # Filter text blocks, keeping those not found in tables
         filtered = []
         for block in text_blocks:
             block_stripped = block.strip()
-            if block_stripped and block_stripped not in table_content:
-                # Also check if block is a substring of any table cell
-                is_in_table = any(block_stripped in tc for tc in table_content if len(tc) > len(block_stripped))
-                if not is_in_table:
-                    filtered.append(block)
+            if not block_stripped:
+                continue
+            if block_stripped in table_content:
+                continue
+            # Only check substring against cells that are longer than the block
+            is_in_table = any(block_stripped in tc for tc in long_cells if len(tc) > len(block_stripped))
+            if not is_in_table:
+                filtered.append(block)
 
         return filtered
+
+    def _detect_recurring_footer(self, slides_data: List[Dict]) -> Optional[List[str]]:
+        """Detect text that appears on 3+ slides — likely a footer/header bar."""
+        from collections import Counter
+        block_counts = Counter()
+        for slide in slides_data:
+            seen = set()
+            for block in slide.get('text_blocks', []):
+                b = block.strip()
+                if b and b not in seen and len(b) > 5:
+                    seen.add(b)
+                    block_counts[b] += 1
+        threshold = max(3, len(slides_data) * 0.15)
+        footers = [text for text, count in block_counts.items() if count >= threshold]
+        return footers if footers else None
+
+    def _merge_short_fragments(self, text_blocks: List[str]) -> List[str]:
+        """Merge consecutive short text fragments that form logical units (e.g. stat blocks)."""
+        if not text_blocks:
+            return text_blocks
+        merged = []
+        buffer = []
+        for block in text_blocks:
+            stripped = block.strip()
+            if len(stripped) <= 35 and not stripped.startswith('[') and not stripped.startswith('|'):
+                buffer.append(stripped)
+            else:
+                if buffer:
+                    merged.append(' '.join(buffer))
+                    buffer = []
+                merged.append(block)
+        if buffer:
+            merged.append(' '.join(buffer))
+        return merged
 
     def encode_image_to_base64(self, image, format="JPEG") -> Tuple[Optional[str], Optional[str]]:
         try:
@@ -615,10 +686,13 @@ Return ONLY valid JSON."""
         content_blocks.append({"type": "text", "text": prompt})
 
         try:
-            response = client.messages.create(
-                model=self.VISION_MODEL,
-                max_tokens=self.MAX_TOKENS_SLIDE_EXTRACTION,
-                messages=[{"role": "user", "content": content_blocks}]
+            response = self._api_call_with_retry(
+                lambda: client.messages.create(
+                    model=self.VISION_MODEL,
+                    max_tokens=self.MAX_TOKENS_SLIDE_EXTRACTION,
+                    messages=[{"role": "user", "content": content_blocks}]
+                ),
+                description="Vision batch extraction"
             )
             results = self.parse_json_response(response.content[0].text)
             if isinstance(results, list):
@@ -673,9 +747,9 @@ Return ONLY valid JSON."""
 
         return detected_level, signals
 
-    @staticmethod
-    def _classification_rank(level: str) -> int:
-        return {'public': 0, 'confidential': 1, 'secret': 2}.get(level, 1)
+    @classmethod
+    def _classification_rank(cls, level: str) -> int:
+        return cls.CLASSIFICATION_RANKS.get(level, 1)
 
     def classify_content_type(self, slides_data: List[Dict], filename: str) -> str:
         if re.search(r'\bagenda\b', filename, re.IGNORECASE):
@@ -705,32 +779,11 @@ Return ONLY valid JSON."""
                     and avg_chars < 200):
                 return 'agenda'
 
-        external_markers = [
-            r'\b(partner|collaboration|alliance|joint|CRO|vendor)\b',
-            r'\b(external|contractor|outsourc|co-develop)\b',
-        ]
-        ext_count = sum(1 for p in external_markers if re.search(p, total_text, re.IGNORECASE))
-
-        academic_markers = [
-            r'\b(patient|study|trial|efficacy|endpoint|cohort)\b',
-            r'\b(publication|abstract|poster|congress|ASCO|AACR|ESMO)\b',
-            r'\b(hypothesis|method|results|conclusion|p[\s\-]?value)\b',
-        ]
-        acad_count = sum(1 for p in academic_markers if re.search(p, total_text, re.IGNORECASE))
-
-        project_markers = [
-            r'\b(compound|molecule|target|inhibitor|mechanism)\b',
-            r'\b(discovery|preclinical|clinical|pipeline|candidate)\b',
-            r'\b(assay|screen|SAR|selectivity|potency|IC50)\b',
-        ]
-        proj_count = sum(1 for p in project_markers if re.search(p, total_text, re.IGNORECASE))
-
-        operational_markers = [
-            r'\b(update|status|progress|timeline|milestone|deliverable)\b',
-            r'\b(team|resource|budget|plan|roadmap|strategy)\b',
-            r'\b(meeting|review|decision|action|department)\b',
-        ]
-        op_count = sum(1 for p in operational_markers if re.search(p, total_text, re.IGNORECASE))
+        # Single-pass content type classification using pre-compiled patterns
+        ext_count = len(self.CONTENT_TYPE_PATTERNS['external'].findall(total_text))
+        acad_count = len(self.CONTENT_TYPE_PATTERNS['academic'].findall(total_text))
+        proj_count = len(self.CONTENT_TYPE_PATTERNS['project'].findall(total_text))
+        op_count = len(self.CONTENT_TYPE_PATTERNS['operational'].findall(total_text))
 
         scores = {
             'external': ext_count,
@@ -744,36 +797,32 @@ Return ONLY valid JSON."""
         if best_score < 2:
             return 'operational'
 
-        if best == 'external' and ext_count >= 2:
-            return 'external'
-        if best == 'academic' and acad_count >= 2:
-            return 'academic'
-        if best == 'project' and proj_count >= 2:
-            return 'project'
-        if best == 'operational' and op_count >= 2:
-            return 'operational'
+        return best
 
-        return 'operational'
+    @staticmethod
+    def _empty_vision_result() -> Dict:
+        return {'figures': [], 'chemical_structures': [], 'content_type_hint': None,
+                'audience': None, 'topics': []}
 
     def analyze_with_vision(self, filepath: Path, slides_data: List[Dict],
-                            source_format: str, skip: bool = False) -> Dict:
+                            source_format: str, skip: bool = False,
+                            preloaded_images: Optional[List[Any]] = None) -> Dict:
         if self.no_vision or skip:
-            return {'figures': [], 'chemical_structures': [], 'content_type_hint': None,
-                    'audience': None, 'topics': []}
+            return self._empty_vision_result()
 
         client = self.get_anthropic_client()
         if not client:
-            return {'figures': [], 'chemical_structures': [], 'content_type_hint': None,
-                    'audience': None, 'topics': []}
+            return self._empty_vision_result()
 
-        if source_format == 'pptx':
+        if preloaded_images is not None:
+            images = preloaded_images
+        elif source_format == 'pptx':
             images = self._convert_pptx_to_images(filepath)
         else:
             images = self._convert_pdf_to_images(filepath)
 
         if not images:
-            return {'figures': [], 'chemical_structures': [], 'content_type_hint': None,
-                    'audience': None, 'topics': []}
+            return self._empty_vision_result()
 
         sample_indices = self._select_representative_slides(slides_data, images)
         sample_images = [(images[i], i + 1) for i in sample_indices if i < len(images)]
@@ -789,8 +838,7 @@ Return ONLY valid JSON."""
                 content_blocks.append({"type": "text", "text": f"[Slide {slide_num}]"})
 
         if not content_blocks:
-            return {'figures': [], 'chemical_structures': [], 'content_type_hint': None,
-                    'audience': None, 'topics': []}
+            return self._empty_vision_result()
 
         prompt = """Analyze these presentation slides. Return a JSON object with:
 {
@@ -822,10 +870,13 @@ Return ONLY valid JSON."""
         content_blocks.append({"type": "text", "text": prompt})
 
         try:
-            response = client.messages.create(
-                model=self.VISION_MODEL,
-                max_tokens=self.MAX_TOKENS_ANALYSIS,
-                messages=[{"role": "user", "content": content_blocks}]
+            response = self._api_call_with_retry(
+                lambda: client.messages.create(
+                    model=self.VISION_MODEL,
+                    max_tokens=self.MAX_TOKENS_ANALYSIS,
+                    messages=[{"role": "user", "content": content_blocks}]
+                ),
+                description="Vision analysis"
             )
             result = self.parse_json_response(response.content[0].text)
             if isinstance(result, dict):
@@ -844,8 +895,7 @@ Return ONLY valid JSON."""
         except Exception as e:
             logger.error(f"Vision analysis failed: {e}")
 
-        return {'figures': [], 'chemical_structures': [], 'content_type_hint': None,
-                'audience': None, 'topics': []}
+        return self._empty_vision_result()
 
     def _convert_pptx_to_images(self, pptx_path: Path) -> List[Any]:
         """Convert PPTX slides to images using PowerPoint COM automation."""
@@ -868,15 +918,20 @@ Return ONLY valid JSON."""
             ppt_app = win32com.client.Dispatch("PowerPoint.Application")
             presentation = ppt_app.Presentations.Open(abs_path, WithWindow=False)
 
-            for i, slide in enumerate(presentation.Slides):
-                img_path = os.path.join(tmp_dir, f"slide_{i+1:03d}.png")
-                slide.Export(img_path, "PNG", 1920, 1080)
-                if os.path.exists(img_path):
-                    img = Image.open(img_path)
-                    images.append(img.copy())
-                    img.close()
+            try:
+                for i, slide in enumerate(presentation.Slides):
+                    img_path = os.path.join(tmp_dir, f"slide_{i+1:03d}.png")
+                    slide.Export(img_path, "PNG", 1920, 1080)
+                    if os.path.exists(img_path):
+                        img = Image.open(img_path)
+                        images.append(img.copy())
+                        img.close()
+            finally:
+                try:
+                    presentation.Close()
+                except Exception:
+                    pass
 
-            presentation.Close()
             logger.info(f"  Exported {len(images)} slide images via PowerPoint")
 
         except Exception as e:
@@ -885,16 +940,12 @@ Return ONLY valid JSON."""
             if ppt_app:
                 try:
                     ppt_app.Quit()
-                except:
+                except Exception:
                     pass
             pythoncom.CoUninitialize()
             # Clean up temp files
             if tmp_dir:
-                import shutil
-                try:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                except:
-                    pass
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return images
 
@@ -907,18 +958,24 @@ Return ONLY valid JSON."""
             import win32com.client
             import pythoncom
             pythoncom.CoInitialize()
-            ppt = win32com.client.Dispatch("PowerPoint.Application")
-            ppt.Quit()
-            pythoncom.CoUninitialize()
-            self._powerpoint_available = True
-            return True
+            ppt = None
+            try:
+                ppt = win32com.client.Dispatch("PowerPoint.Application")
+                self._powerpoint_available = True
+            except Exception as e:
+                logger.warning(f"  PowerPoint not available for slide rendering: {e}")
+                self._powerpoint_available = False
+            finally:
+                if ppt:
+                    try:
+                        ppt.Quit()
+                    except Exception:
+                        pass
+                pythoncom.CoUninitialize()
+            return self._powerpoint_available
         except ImportError:
             logger.warning("  win32com not installed — PowerPoint rendering unavailable. "
                           "Install with: pip install pywin32")
-            self._powerpoint_available = False
-            return False
-        except Exception as e:
-            logger.warning(f"  PowerPoint not available for slide rendering: {e}")
             self._powerpoint_available = False
             return False
 
@@ -938,7 +995,8 @@ Return ONLY valid JSON."""
         return [non_boilerplate[int(i * step)] for i in range(max_slides)]
 
     def refine_chemical_structures(self, filepath: Path, structures: List[Dict],
-                                    slides_data: List[Dict], source_format: str) -> List[Dict]:
+                                    slides_data: List[Dict], source_format: str,
+                                    preloaded_images: Optional[List[Any]] = None) -> List[Dict]:
         if not structures or self.no_vision:
             return structures
 
@@ -952,7 +1010,9 @@ Return ONLY valid JSON."""
         if not client:
             return structures
 
-        if source_format == 'pptx':
+        if preloaded_images is not None:
+            images = preloaded_images
+        elif source_format == 'pptx':
             images = self._convert_pptx_to_images(filepath)
         else:
             images = self._convert_pdf_to_images(filepath)
@@ -1000,10 +1060,13 @@ Return ONLY valid JSON."""
             ]
 
             try:
-                response = client.messages.create(
-                    model=self.VISION_MODEL,
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": content}]
+                response = self._api_call_with_retry(
+                    lambda: client.messages.create(
+                        model=self.VISION_MODEL,
+                        max_tokens=1024,
+                        messages=[{"role": "user", "content": content}]
+                    ),
+                    description=f"SMILES refinement ({label})"
                 )
                 result = self.parse_json_response(response.content[0].text)
                 if result and result.get('smiles') and self.validate_smiles(result['smiles']):
@@ -1032,7 +1095,10 @@ Return ONLY valid JSON."""
         return True
 
     def _detect_language(self, slides_data: List[Dict]) -> str:
-        """Detect presentation language from slide text. Returns ISO 639-1 code."""
+        """Detect presentation language from slide text. Returns ISO 639-1 code.
+
+        Currently supports English and German only; defaults to 'en' for other languages.
+        """
         text_sample = []
         for slide in slides_data[:20]:
             text_sample.extend(slide.get('text_blocks', []))
@@ -1107,10 +1173,13 @@ Format your response as:
 (bullet points here)"""
 
         try:
-            response = client.messages.create(
-                model=self.VISION_MODEL,
-                max_tokens=self.MAX_TOKENS_SUMMARY,
-                messages=[{"role": "user", "content": prompt}]
+            response = self._api_call_with_retry(
+                lambda: client.messages.create(
+                    model=self.VISION_MODEL,
+                    max_tokens=self.MAX_TOKENS_SUMMARY,
+                    messages=[{"role": "user", "content": prompt}]
+                ),
+                description="Summary generation"
             )
             text = response.content[0].text
 
@@ -1201,6 +1270,8 @@ Format your response as:
                 seen.add(key)
                 unique_metrics.append(m)
 
+        if len(unique_metrics) > 20:
+            logger.info(f"  Metrics truncated: showing 20 of {len(unique_metrics)}")
         return unique_metrics[:20]
 
     def extract_timelines(self, slides_data: List[Dict]) -> List[Dict]:
@@ -1224,6 +1295,8 @@ Format your response as:
                         'slide': slide['number'],
                     })
 
+        if len(timelines) > 15:
+            logger.info(f"  Timelines truncated: showing 15 of {len(timelines)}")
         return timelines[:15]
 
     def calculate_quality_score(self, slides_data: List[Dict], num_slides: int,
@@ -1361,15 +1434,21 @@ Format your response as:
 
         # Slide Content
         md.append("## Slide Content\n")
+        recurring_footers = self._detect_recurring_footer(slides_data) or []
         for slide in slides_data:
             if slide.get('is_boilerplate'):
                 continue
             title = slide.get('title') or f"Slide {slide['number']}"
             md.append(f"### Slide {slide['number']}: {title}\n")
 
-            for block in slide.get('text_blocks', []):
-                if block != title:
-                    md.append(f"{block}\n")
+            slide_num_str = str(slide['number'])
+            blocks = [b for b in slide.get('text_blocks', [])
+                      if b != title
+                      and b.strip() != slide_num_str
+                      and b.strip() not in recurring_footers]
+            blocks = self._merge_short_fragments(blocks)
+            for block in blocks:
+                md.append(f"{block}\n")
 
             for table in slide.get('tables', []):
                 if table:
@@ -1490,7 +1569,7 @@ Format your response as:
             date=date,
             classification=classification,
         )
-        return f"{filename}.md"
+        return sanitize_filename(f"{filename}.md")
 
     def check_if_processed(self, file_info: Dict, classification: str = 'confidential') -> bool:
         expected = self.generate_output_filename(file_info, classification)
@@ -1527,6 +1606,12 @@ Format your response as:
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing: {filepath.name}")
         logger.info(f"{'='*60}")
+
+        # File size check
+        file_size_mb = filepath.stat().st_size / (1024 * 1024)
+        if file_size_mb > self.MAX_FILE_SIZE_MB:
+            logger.error(f"  File too large: {file_size_mb:.1f}MB (max: {self.MAX_FILE_SIZE_MB}MB) — skipping")
+            return False
 
         # Step 1: Parse filename
         file_info = self.parse_filename(filepath)
@@ -1588,8 +1673,17 @@ Format your response as:
         else:
             logger.info("\n--- Vision AI analysis ---")
 
+        # Convert images once and reuse for vision analysis + structure refinement
+        slide_images = None
+        if run_vision_analysis:
+            if file_info['source_format'] == 'pptx':
+                slide_images = self._convert_pptx_to_images(filepath)
+            else:
+                slide_images = self._convert_pdf_to_images(filepath)
+
         vision_result = self.analyze_with_vision(filepath, content['slides'], file_info['source_format'],
-                                                  skip=not run_vision_analysis)
+                                                  skip=not run_vision_analysis,
+                                                  preloaded_images=slide_images)
 
         if vision_result.get('content_type_hint'):
             content_type = vision_result['content_type_hint']
@@ -1608,7 +1702,8 @@ Format your response as:
         if chemical_structures and not file_info.get('no_structures'):
             logger.info(f"\n--- Chemical structure refinement ({len(chemical_structures)} structures) ---")
             chemical_structures = self.refine_chemical_structures(
-                filepath, chemical_structures, content['slides'], file_info['source_format'])
+                filepath, chemical_structures, content['slides'], file_info['source_format'],
+                preloaded_images=slide_images)
         elif file_info.get('no_structures'):
             logger.info("  Skipping SMILES refinement ([No Structures] in filename)")
             chemical_structures = []
@@ -1756,6 +1851,16 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Validate paths
+    try:
+        validate_path(args.input, must_exist=True, allow_dir=True, allow_file=False)
+        validate_output_path(args.output)
+        if args.single:
+            validate_path(args.single, must_exist=True, allow_file=True, allow_dir=False)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"Path validation failed: {e}")
+        return
+
     pipeline = PresentationPipeline(
         input_folder=args.input,
         output_dir=args.output,
@@ -1766,9 +1871,6 @@ def main():
 
     if args.single:
         single_path = Path(args.single)
-        if not single_path.exists():
-            logger.error(f"File not found: {single_path}")
-            return
         pipeline.process_single_presentation(single_path, skip_existing=not args.no_skip)
     else:
         pipeline.process_all_presentations(skip_existing=not args.no_skip)

@@ -27,26 +27,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load credentials from Windows User environment if not in current environment
-if not os.environ.get('ANTHROPIC_AUTH_TOKEN') or not os.environ.get('ANTHROPIC_BASE_URL'):
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_READ)
-        try:
-            token, _ = winreg.QueryValueEx(key, 'ANTHROPIC_AUTH_TOKEN')
-            os.environ['ANTHROPIC_AUTH_TOKEN'] = token
-            logger.info("Loaded ANTHROPIC_AUTH_TOKEN from Windows User environment")
-        except:
-            pass
-        try:
-            url, _ = winreg.QueryValueEx(key, 'ANTHROPIC_BASE_URL')
-            os.environ['ANTHROPIC_BASE_URL'] = url
-            logger.info("Loaded ANTHROPIC_BASE_URL from Windows User environment")
-        except:
-            pass
-        winreg.CloseKey(key)
-    except:
-        pass
+# Load credentials from Windows User environment (with URL validation)
+from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, sanitize_filename
+load_credentials_from_registry()
 
 
 class PatentPipeline:
@@ -146,14 +129,14 @@ class PatentPipeline:
     }
 
     PATENT_SECTION_PATTERNS = {
-        'technical_field': r'(?:Technical\s+[Ff]ield|TECHNICAL\s+FIELD|Field\s+of\s+(?:the\s+)?[Ii]nvention|FIELD\s+OF\s+(?:THE\s+)?INVENTION)',
-        'background': r'(?:Background|BACKGROUND|Prior\s+[Aa]rt|PRIOR\s+ART|Background\s+of\s+the\s+[Ii]nvention)',
-        'summary': r'(?:Summary|SUMMARY|Summary\s+of\s+(?:the\s+)?[Ii]nvention|SUMMARY\s+OF\s+(?:THE\s+)?INVENTION)',
-        'claims': r'(?:Claims|CLAIMS|[Ww]hat\s+[Ii]s\s+[Cc]laimed|WHAT\s+IS\s+CLAIMED)',
-        'detailed_description': r'(?:Detailed\s+[Dd]escription|DETAILED\s+DESCRIPTION|Description\s+of\s+(?:the\s+)?[Ee]mbodiments)',
-        'examples': r'(?:Examples?\s|EXAMPLES?\s|Experimental|EXPERIMENTAL)',
-        'drawings': r'(?:Brief\s+[Dd]escription\s+of\s+(?:the\s+)?[Dd]rawings|BRIEF\s+DESCRIPTION\s+OF\s+(?:THE\s+)?DRAWINGS|Legends?\s+of\s+(?:the\s+)?[Ff]igures)',
-        'definitions': r'(?:Definitions\n|DEFINITIONS\n)',
+        'technical_field': re.compile(r'(?:Technical\s+[Ff]ield|TECHNICAL\s+FIELD|Field\s+of\s+(?:the\s+)?[Ii]nvention|FIELD\s+OF\s+(?:THE\s+)?INVENTION)'),
+        'background': re.compile(r'(?:Background|BACKGROUND|Prior\s+[Aa]rt|PRIOR\s+ART|Background\s+of\s+the\s+[Ii]nvention)'),
+        'summary': re.compile(r'(?:Summary|SUMMARY|Summary\s+of\s+(?:the\s+)?[Ii]nvention|SUMMARY\s+OF\s+(?:THE\s+)?INVENTION)'),
+        'claims': re.compile(r'(?:Claims|CLAIMS|[Ww]hat\s+[Ii]s\s+[Cc]laimed|WHAT\s+IS\s+CLAIMED)'),
+        'detailed_description': re.compile(r'(?:Detailed\s+[Dd]escription|DETAILED\s+DESCRIPTION|Description\s+of\s+(?:the\s+)?[Ee]mbodiments)'),
+        'examples': re.compile(r'(?:Examples?\s|EXAMPLES?\s|Experimental|EXPERIMENTAL)'),
+        'drawings': re.compile(r'(?:Brief\s+[Dd]escription\s+of\s+(?:the\s+)?[Dd]rawings|BRIEF\s+DESCRIPTION\s+OF\s+(?:THE\s+)?DRAWINGS|Legends?\s+of\s+(?:the\s+)?[Ff]igures)'),
+        'definitions': re.compile(r'(?:Definitions\n|DEFINITIONS\n)'),
     }
 
     # Patent page header pattern (repeats on every page)
@@ -276,11 +259,11 @@ class PatentPipeline:
         return self._client
 
     def _track_api_call(self, count: int = 1) -> bool:
-        """Track API calls and check budget. Returns False if budget exceeded."""
-        self._api_call_count += count
-        if self._budget_cap and self._api_call_count > self._budget_cap:
-            logger.warning(f"  BUDGET EXCEEDED: {self._api_call_count}/{self._budget_cap} API calls")
+        """Track API calls and check budget. Returns False if budget would be exceeded."""
+        if self._budget_cap and (self._api_call_count + count) > self._budget_cap:
+            logger.warning(f"  BUDGET EXCEEDED: {self._api_call_count + count}/{self._budget_cap} API calls")
             return False
+        self._api_call_count += count
         return True
 
     def _budget_remaining(self) -> int:
@@ -343,15 +326,24 @@ class PatentPipeline:
             from PIL import Image
             Image.MAX_IMAGE_PIXELS = None
             doc = fitz.open(str(pdf_path))
-            zoom = dpi / 72
-            mat = fitz.Matrix(zoom, zoom)
-            for page_num in page_numbers:
-                if page_num < len(doc):
-                    pix = doc[page_num].get_pixmap(matrix=mat)
-                    images[page_num] = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            doc.close()
+            try:
+                zoom = dpi / 72
+                mat = fitz.Matrix(zoom, zoom)
+                for page_num in page_numbers:
+                    if page_num < len(doc):
+                        pix = doc[page_num].get_pixmap(matrix=mat)
+                        images[page_num] = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            finally:
+                doc.close()
         except Exception as e:
             logger.error(f"Error rendering pages: {e}")
+            # Clean up any partial images on error
+            for img in images.values():
+                try:
+                    img.close()
+                except Exception:
+                    pass
+            images.clear()
         return images
 
     def parse_json_response(self, response_text: str) -> Optional[Any]:
@@ -1010,7 +1002,7 @@ Return ONLY a JSON array like: [{{"page": 55, "type": "text"}}, {{"page": 111, "
 
     def _find_claims_pages(self, page_data: List[Dict]) -> List[int]:
         """Identify which pages contain the claims section from OCR'd text."""
-        claims_pattern = re.compile(self.PATENT_SECTION_PATTERNS['claims'])
+        claims_pattern = self.PATENT_SECTION_PATTERNS['claims']
         claim_number_pattern = re.compile(r'^\s*(\d+)\.\s+(?:A|An|The|Wherein|Said)\s', re.MULTILINE)
 
         claims_pages = []
@@ -1268,7 +1260,7 @@ Important:
         section_positions = []
 
         for section_name, pattern in self.PATENT_SECTION_PATTERNS.items():
-            matches = list(re.finditer(pattern, full_text))
+            matches = list(pattern.finditer(full_text))
             if not matches:
                 continue
             # For claims: use the match that's followed by numbered claims (1. A compound...)
@@ -1340,6 +1332,8 @@ Important:
             return {'total_claims': 0, 'independent_claims': [], 'dependent_claims': [], 'claims': []}
 
         claims = []
+        # Prepend newline to ensure claim 1 is captured by the split pattern
+        claims_text = '\n' + claims_text.strip()
         claim_splits = re.split(r'\n(?=\d+\.\s)', claims_text)
 
         for chunk in claim_splits:
@@ -1679,7 +1673,7 @@ Max 10 compounds, max 10 biological results. Return ONLY valid JSON."""
     # ─── Stage 5.5: Chemical Structure SMILES Refinement ────────────────────
 
     def validate_smiles(self, smiles: str) -> bool:
-        """Basic SMILES format validation (no chemistry library needed)."""
+        """SMILES validation: uses RDKit if available, otherwise basic format checks."""
         if not smiles or len(smiles) < 3:
             return False
         if not self.SMILES_VALID_CHARS.match(smiles):
@@ -1688,7 +1682,15 @@ Max 10 compounds, max 10 biological results. Return ONLY valid JSON."""
             return False
         if smiles.count('[') != smiles.count(']'):
             return False
-        return True
+        # Use RDKit for chemical validity if available
+        try:
+            from rdkit import Chem
+            mol = Chem.MolFromSmiles(smiles)
+            return mol is not None
+        except ImportError:
+            return True  # Basic checks passed, no RDKit available
+        except Exception:
+            return False
 
     def refine_chemical_structures(self, pdf_path: Path, figures: List[Dict],
                                     sections: Dict[str, str]) -> List[Dict]:
@@ -2108,24 +2110,15 @@ Format your response EXACTLY as:
         # Semantic classification fields from Stage 6
         classification = summaries.get('classification', {})
         if classification:
-            if classification.get('therapeutic_area'):
-                md.append(f"therapeutic_area: \"{classification['therapeutic_area']}\"\n")
-            if classification.get('mechanism_of_action'):
-                md.append(f"mechanism_of_action: \"{classification['mechanism_of_action']}\"\n")
-            if classification.get('target_protein'):
-                md.append(f"target_protein: \"{classification['target_protein']}\"\n")
-            if classification.get('target_class'):
-                md.append(f"target_class: \"{classification['target_class']}\"\n")
-            if classification.get('drug_modality'):
-                md.append(f"drug_modality: \"{classification['drug_modality']}\"\n")
-            if classification.get('scaffold'):
-                md.append(f"scaffold: \"{classification['scaffold']}\"\n")
-            if classification.get('comparators'):
-                comps = classification['comparators']
-                if isinstance(comps, list):
-                    md.append("comparators:\n")
-                    for c in comps[:10]:
-                        md.append(f"  - \"{c}\"\n")
+            for field in ('therapeutic_area', 'mechanism_of_action', 'target_protein',
+                          'target_class', 'drug_modality', 'scaffold'):
+                if classification.get(field):
+                    md.append(f'{field}: "{classification[field]}"\n')
+            comps = classification.get('comparators')
+            if isinstance(comps, list) and comps:
+                md.append("comparators:\n")
+                for c in comps[:10]:
+                    md.append(f'  - "{c}"\n')
         # Compound statistics
         compounds = key_data.get('key_compounds', [])
         bio_results = key_data.get('biological_results', [])
@@ -2379,7 +2372,7 @@ Format your response EXACTLY as:
 
         patent_id = bib.get('patent_number', pdf_path.stem)
 
-        if skip_existing and any(patent_id in f for f in self._existing_files):
+        if skip_existing and patent_id in self._existing_files:
             logger.info(f"Patent {patent_id} already processed - skipping")
             return True
 
@@ -2600,6 +2593,9 @@ Format your response EXACTLY as:
                     success_count += 1
                 else:
                     fail_count += 1
+            except KeyboardInterrupt:
+                logger.info("\nProcessing interrupted by user")
+                raise
             except Exception as e:
                 logger.error(f"Error processing {pdf_path.name}: {e}")
                 import traceback
@@ -2658,6 +2654,17 @@ def main():
     if not args.single and not args.input:
         parser.error("Either --single or --input must be provided")
 
+    # Validate paths
+    try:
+        if args.input:
+            validate_path(args.input, must_exist=True, allow_dir=True, allow_file=False)
+        validate_output_path(args.output)
+        if args.single:
+            validate_path(args.single, must_exist=True, allow_file=True, allow_dir=False)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"Path validation failed: {e}")
+        return
+
     try:
         pipeline = PatentPipeline(output_dir=args.output, budget=args.budget,
                                    ocr_engine=args.ocr_engine,
@@ -2667,9 +2674,6 @@ def main():
 
         if args.single:
             pdf_path = Path(args.single)
-            if not pdf_path.exists():
-                logger.error(f"File not found: {pdf_path}")
-                return
             pipeline.process_single_patent(
                 pdf_path,
                 no_vision=args.no_vision or args.claims_only,

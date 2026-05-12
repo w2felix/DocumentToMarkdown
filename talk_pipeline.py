@@ -21,23 +21,9 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-if not os.environ.get('ANTHROPIC_AUTH_TOKEN') or not os.environ.get('ANTHROPIC_BASE_URL'):
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_READ)
-        try:
-            token, _ = winreg.QueryValueEx(key, 'ANTHROPIC_AUTH_TOKEN')
-            os.environ['ANTHROPIC_AUTH_TOKEN'] = token
-        except:
-            pass
-        try:
-            url, _ = winreg.QueryValueEx(key, 'ANTHROPIC_BASE_URL')
-            os.environ['ANTHROPIC_BASE_URL'] = url
-        except:
-            pass
-        winreg.CloseKey(key)
-    except:
-        pass
+# Load credentials from Windows User environment (with URL validation)
+from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, sanitize_filename
+load_credentials_from_registry()
 
 
 class TalkPipeline:
@@ -74,6 +60,12 @@ class TalkPipeline:
         self._init_processing_log()
 
         self._existing_files = set(f.stem for f in self.output_dir.glob("*.md"))
+        # Build O(1) lookup for processed talk keys (talk_number + session_code)
+        self._processed_keys = set()
+        for f in self._existing_files:
+            match = re.match(r'^talk_(\d+)_([A-Z0-9]+)_', f, re.IGNORECASE)
+            if match:
+                self._processed_keys.add(f"{match.group(1)}_{match.group(2)}")
 
         self.metadata_excel = Path(metadata_excel)
         self.metadata_df = None
@@ -186,18 +178,19 @@ class TalkPipeline:
         if matches.empty:
             return None
 
-        best_row = None
-        best_score = 0
+        title_words = [w.lower() for w in title_from_file.split() if len(w) > 3]
 
-        for idx, row in matches.iterrows():
-            clean_title = re.sub(r'<[^>]+>', '', str(row['Abstract Title']))
-            title_words = [w.lower() for w in title_from_file.split() if len(w) > 3]
-            score = sum(1 for w in title_words if w in clean_title.lower())
-            if score > best_score:
-                best_score = score
-                best_row = row
+        def _score_title(abstract_title):
+            clean_title = re.sub(r'<[^>]+>', '', str(abstract_title)).lower()
+            return sum(1 for w in title_words if w in clean_title)
 
-        if best_row is not None and best_score >= 2:
+        matches = matches.copy()
+        matches['_match_score'] = matches['Abstract Title'].apply(_score_title)
+        best_idx = matches['_match_score'].idxmax()
+        best_score = matches.loc[best_idx, '_match_score']
+        best_row = matches.loc[best_idx]
+
+        if best_score >= 2:
             def clean_html(val):
                 if pd.isna(val):
                     return None
@@ -225,20 +218,22 @@ class TalkPipeline:
 
             Image.MAX_IMAGE_PIXELS = None
             doc = fitz.open(str(pdf_path))
-            num_pages = len(doc)
-            logger.info(f"Converting {num_pages} slides at {self.RENDER_DPI} DPI...")
+            try:
+                num_pages = len(doc)
+                logger.info(f"Converting {num_pages} slides at {self.RENDER_DPI} DPI...")
 
-            images = []
-            zoom = self.RENDER_DPI / 72
-            mat = fitz.Matrix(zoom, zoom)
+                images = []
+                zoom = self.RENDER_DPI / 72
+                mat = fitz.Matrix(zoom, zoom)
 
-            for page_num in range(num_pages):
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=mat)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
+                for page_num in range(num_pages):
+                    page = doc[page_num]
+                    pix = page.get_pixmap(matrix=mat)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    images.append(img)
+            finally:
+                doc.close()
 
-            doc.close()
             if images:
                 logger.info(f"Converted {len(images)} slides ({images[0].size[0]}x{images[0].size[1]} px)")
             return images
@@ -360,22 +355,28 @@ Do NOT skip any data-containing slides."""
         ocr_texts = self.ocr_slide_images(slide_images)
         total_ocr_chars = sum(len(t) for t in ocr_texts)
 
-        logger.info("Encoding slide images to base64...")
-        encoded_images = []
-        for img in slide_images:
-            img_b64, media_type = self.encode_image_to_base64(img)
-            if img_b64 is not None:
-                encoded_images.append((img_b64, media_type))
-            else:
-                encoded_images.append(("", "image/jpeg"))
-        del slide_images
-
-        total_slides = len(encoded_images)
+        logger.info("Encoding slide images to base64 per batch...")
+        total_slides = len(slide_images)
         batches = []
         for batch_start in range(0, total_slides, self.SLIDES_PER_BATCH):
             batch_end = min(batch_start + self.SLIDES_PER_BATCH, total_slides)
-            batches.append((batch_start, encoded_images[batch_start:batch_end],
+            # Encode only this batch's images, then free them immediately
+            batch_encoded = []
+            for idx in range(batch_start, batch_end):
+                img_b64, media_type = self.encode_image_to_base64(slide_images[idx])
+                if img_b64 is not None:
+                    batch_encoded.append((img_b64, media_type))
+                else:
+                    batch_encoded.append(("", "image/jpeg"))
+                # Free the PIL image immediately after encoding
+                try:
+                    slide_images[idx].close()
+                except Exception:
+                    pass
+                slide_images[idx] = None
+            batches.append((batch_start, batch_encoded,
                            ocr_texts[batch_start:batch_end]))
+        del slide_images
 
         workers = min(self.MAX_CONCURRENT_BATCHES, len(batches))
         logger.info(f"Sending {len(batches)} batches with concurrency={workers}...")
@@ -630,8 +631,8 @@ SECTION 2: Key Takeaways (4-7 bullet points)
 
     def check_if_processed(self, file_info: Dict) -> bool:
         """Check if a talk has already been processed (uses cached filenames)."""
-        prefix = f"talk_{file_info['talk_number']}_{file_info['session_code']}_"
-        return any(f.startswith(prefix) for f in self._existing_files)
+        key = f"{file_info['talk_number']}_{file_info['session_code']}"
+        return key in self._processed_keys
 
     def generate_output_filename(self, file_info: Dict, abstract: Optional[Dict] = None) -> str:
         """Generate output filename based on naming scheme."""
@@ -773,6 +774,9 @@ SECTION 2: Key Takeaways (4-7 bullet points)
                     success_count += 1
                 else:
                     fail_count += 1
+            except KeyboardInterrupt:
+                logger.info("\nProcessing interrupted by user")
+                raise
             except Exception as e:
                 logger.error(f"Unexpected error processing {pdf_path.name}: {e}")
                 fail_count += 1
@@ -814,6 +818,18 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Validate paths
+    try:
+        validate_path(args.talks, must_exist=True, allow_dir=True, allow_file=False)
+        validate_output_path(args.output)
+        if args.metadata:
+            validate_path(args.metadata, must_exist=True, allow_file=True, allow_dir=False)
+        if args.single:
+            validate_path(args.single, must_exist=True, allow_file=True, allow_dir=False)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"Path validation failed: {e}")
+        return
+
     pipeline = TalkPipeline(
         talks_folder=args.talks,
         metadata_excel=args.metadata,
@@ -824,9 +840,6 @@ def main():
 
     if args.single:
         single_path = Path(args.single)
-        if not single_path.exists():
-            logger.error(f"File not found: {single_path}")
-            return
         pipeline.process_single_talk(single_path, skip_existing=not args.no_skip)
     else:
         pipeline.process_all_talks(skip_existing=not args.no_skip)
