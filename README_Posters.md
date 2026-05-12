@@ -84,18 +84,19 @@ python poster_pipeline.py [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--sharepoint` | *(required)* | Folder containing PDF posters |
+| `--input` / `--sharepoint` | *(required)* | Folder containing PDF posters |
 | `--metadata` | *(optional)* | Excel file with poster metadata (enriches output) |
 | `--output` | `output` | Output directory for markdown files |
 | `--single` | *(none)* | Process a single PDF file only |
-| `--force-ocr` | `False` | Force OCR even if native text extraction works |
+| `--recursive` | `False` | Recursively search subfolders for PDF files |
 | `--no-skip` | `False` | Reprocess files that already exist |
+| `--force-ocr` | `False` | Force OCR even if native text extraction works |
 | `--ocr-dpi` | `200` | DPI for Tesseract OCR |
 | `--no-detailed-analysis` | `False` | Skip Stage 2 figure analysis (faster) |
-| `--recursive` | `False` | Recursively search subfolders for PDF files |
 | `--naming` | `default` | Filename scheme: `default` or `standardized` |
 | `--conference` | *(none)* | Conference name for standardized naming (e.g., AACR) |
 | `--year` | *(none)* | Year for standardized naming (e.g., 2026) |
+| `--verbose` | `False` | Enable debug logging |
 
 **Metadata Column Configuration** — only needed when the Excel file uses different column names:
 

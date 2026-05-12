@@ -56,15 +56,24 @@ class TalkPipeline:
     MAX_TOKENS_SUMMARY = 2048
     MAX_TOKENS_TAKEAWAYS = 1024
 
-    def __init__(self, talks_folder: str, metadata_excel: str, output_dir: str = "output_talks"):
+    NAMING_SCHEMES = {
+        'default': 'talk_{talk_number}_{session_code}_{speaker}_{title_slug}',
+        'detailed': 'talk_{session_code}_{speaker}_{title_slug}',
+        'dated': '{date}_{session_code}_{speaker}_{title_slug}',
+    }
+
+    def __init__(self, talks_folder: str, metadata_excel: str, output_dir: str = "output_talks",
+                 recursive: bool = False, naming: str = "default"):
         self.talks_folder = Path(talks_folder)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self._recursive = recursive
+        self._naming = naming
 
         self.processing_log_path = self.output_dir / "processing_log.txt"
         self._init_processing_log()
 
-        self._existing_files = set(f.stem for f in self.output_dir.glob("talk_*.md"))
+        self._existing_files = set(f.stem for f in self.output_dir.glob("*.md"))
 
         self.metadata_excel = Path(metadata_excel)
         self.metadata_df = None
@@ -131,7 +140,10 @@ class TalkPipeline:
 
     def list_talk_files(self) -> List[Path]:
         """List all PDF files in the talks folder."""
-        pdf_files = sorted(self.talks_folder.glob("*.pdf"))
+        if self._recursive:
+            pdf_files = sorted(self.talks_folder.rglob("*.pdf"))
+        else:
+            pdf_files = sorted(self.talks_folder.glob("*.pdf"))
         logger.info(f"Found {len(pdf_files)} talk PDFs")
         return pdf_files
 
@@ -621,11 +633,21 @@ SECTION 2: Key Takeaways (4-7 bullet points)
         prefix = f"talk_{file_info['talk_number']}_{file_info['session_code']}_"
         return any(f.startswith(prefix) for f in self._existing_files)
 
-    def generate_output_filename(self, file_info: Dict) -> str:
-        """Generate output filename for the markdown."""
+    def generate_output_filename(self, file_info: Dict, abstract: Optional[Dict] = None) -> str:
+        """Generate output filename based on naming scheme."""
         speaker_clean = re.sub(r'[^a-zA-Z0-9]', '_', file_info['speaker_last_name'])
         title_words = re.sub(r'[^a-zA-Z0-9\s]', '', file_info['title']).split()[:5]
         title_slug = '_'.join(w.lower() for w in title_words)
+
+        if self._naming == 'default':
+            return f"talk_{file_info['talk_number']}_{file_info['session_code']}_{speaker_clean}_{title_slug}.md"
+        elif self._naming == 'detailed':
+            return f"talk_{file_info['session_code']}_{speaker_clean}_{title_slug}.md"
+        elif self._naming == 'dated':
+            date = 'undated'
+            if abstract and abstract.get('day'):
+                date = str(abstract['day']).replace(' ', '-').replace('/', '-')
+            return f"{date}_{file_info['session_code']}_{speaker_clean}_{title_slug}.md"
         return f"talk_{file_info['talk_number']}_{file_info['session_code']}_{speaker_clean}_{title_slug}.md"
 
     def process_single_talk(self, pdf_path: Path, skip_existing: bool = True) -> bool:
@@ -701,7 +723,7 @@ SECTION 2: Key Takeaways (4-7 bullet points)
         )
 
         # Save output
-        output_filename = self.generate_output_filename(file_info)
+        output_filename = self.generate_output_filename(file_info, abstract)
         output_path = self.output_dir / output_filename
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(markdown)
@@ -729,6 +751,9 @@ SECTION 2: Key Takeaways (4-7 bullet points)
         logger.info("=" * 70)
         logger.info(f"Talks folder: {self.talks_folder}")
         logger.info(f"Output directory: {self.output_dir}")
+        logger.info(f"Recursive: {self._recursive}")
+        logger.info(f"Naming: {self._naming}")
+        logger.info(f"Skip existing: {skip_existing}")
         logger.info(f"Vision model: {self.VISION_MODEL}")
         logger.info(f"Batch size: {self.SLIDES_PER_BATCH} slides/call, max {self.MAX_CONCURRENT_BATCHES} concurrent")
         logger.info("=" * 70)
@@ -763,7 +788,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Process scientific talk PDFs into structured markdown using Vision AI"
     )
-    parser.add_argument("--talks", default=r"C:\Users\M286901\OneDrive - MerckGroup\Conference Platform - Talks",
+    parser.add_argument("--input", "--talks", dest="talks",
+                       default=r"C:\Users\M286901\OneDrive - MerckGroup\Conference Platform - Talks",
                        help="Folder containing talk PDFs")
     parser.add_argument("--metadata", default=r"test_poster\AACR2026_Abstracts.xlsx",
                        help="Excel file with abstract metadata")
@@ -771,15 +797,29 @@ def main():
                        help="Output directory for markdown files")
     parser.add_argument("--single", default=None,
                        help="Process a single PDF file only")
+    parser.add_argument("--recursive", action="store_true",
+                       help="Recursively search subfolders for PDF files")
     parser.add_argument("--no-skip", action="store_true",
                        help="Reprocess files that already exist")
+    parser.add_argument("--naming", choices=["default", "detailed", "dated"],
+                       default="default",
+                       help="Output filename scheme: default (talk_NUM_SESSION_Speaker_Title), "
+                            "detailed (talk_SESSION_Speaker_Title), "
+                            "dated (date_SESSION_Speaker_Title)")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Enable verbose/debug logging")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     pipeline = TalkPipeline(
         talks_folder=args.talks,
         metadata_excel=args.metadata,
-        output_dir=args.output
+        output_dir=args.output,
+        recursive=args.recursive,
+        naming=args.naming
     )
 
     if args.single:

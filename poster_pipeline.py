@@ -3034,8 +3034,8 @@ def main():
         description='Process scientific posters to structured markdown with AI',
         epilog='Note: Vision AI (Claude) is required for all processing.'
     )
-    parser.add_argument('--sharepoint', type=str, required=True,
-                       help='Path to SharePoint folder containing PDFs')
+    parser.add_argument('--input', '--sharepoint', dest='sharepoint', type=str, required=True,
+                       help='Path to folder containing poster PDFs')
     parser.add_argument('--metadata', type=str, required=False, default=None,
                        help='Path to Excel metadata file (optional, enriches output with session info)')
     parser.add_argument('--output', type=str, default='output',
@@ -3061,6 +3061,8 @@ def main():
                        help='Conference name for standardized naming (e.g., AACR, ASCO)')
     parser.add_argument('--year', type=str, default=None,
                        help='Year for standardized naming (e.g., 2026)')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose/debug logging')
 
     col_group = parser.add_argument_group('Metadata Column Configuration',
         'Map logical roles to actual Excel column names. Only specify columns that differ from defaults.')
@@ -3095,6 +3097,9 @@ def main():
                            help='Interested people column (default: "Interested Colleagues")')
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     # Build column overrides from CLI args
     column_overrides = {}

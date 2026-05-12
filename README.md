@@ -45,11 +45,11 @@ Restart your terminal after setting these.
 **Posters:**
 ```bash
 # with metadata
-python poster_pipeline.py --sharepoint "path/to/poster_pdfs" --metadata "abstracts.xlsx"
+python poster_pipeline.py --input "path/to/poster_pdfs" --metadata "abstracts.xlsx"
 # without metadata
-python poster_pipeline.py --sharepoint "path/to/poster_pdfs"
+python poster_pipeline.py --input "path/to/poster_pdfs"
 # standardized filenames
-python poster_pipeline.py --sharepoint "path/to/poster_pdfs" --naming standardized --conference AACR --year 2026
+python poster_pipeline.py --input "path/to/poster_pdfs" --naming standardized --conference AACR --year 2026
 ```
 
 **Patents:**
@@ -63,7 +63,7 @@ python patent_pipeline.py --input "path/to/patent_pdfs" --recursive --naming det
 
 **Talks:**
 ```bash
-python talk_pipeline.py --talks "path/to/talk_pdfs" --metadata "abstracts.xlsx"
+python talk_pipeline.py --input "path/to/talk_pdfs" --metadata "abstracts.xlsx"
 # or a single file:
 python talk_pipeline.py --single "path/to/talk.pdf"
 ```
@@ -77,65 +77,25 @@ python presentation_pipeline.py --input "path/to/presentations" --no-vision
 python presentation_pipeline.py --single "path/to/file.pptx" --naming dated
 ```
 
-## Pipeline Options
+## Common Flags
 
-### Poster Pipeline
-
-| Flag | Description |
-|------|-------------|
-| `--sharepoint` | Folder containing poster PDFs (required) |
-| `--metadata` | Excel file with poster metadata (optional, enriches output) |
-| `--output` | Output directory (default: `output`) |
-| `--single` | Process a single PDF file |
-| `--recursive` | Search subfolders for PDFs |
-| `--no-skip` | Reprocess already-converted files |
-| `--force-ocr` | Force OCR even when native text works |
-| `--no-detailed-analysis` | Skip two-stage figure analysis (faster) |
-| `--naming` | Filename scheme: `default` or `standardized` |
-| `--conference` | Conference name for standardized naming (e.g., AACR) |
-| `--year` | Year for standardized naming (e.g., 2026) |
-| `--sheet` | Excel sheet name (default: `Full_Program_Copy`) |
-| `--col-*` | Remap metadata columns — see [Poster Pipeline docs](README_Posters.md#excel-metadata-optional) |
-
-### Patent Pipeline
+All pipelines share a consistent CLI interface:
 
 | Flag | Description |
 |------|-------------|
-| `--input` | Folder containing patent PDFs |
-| `--single` | Process a single patent PDF |
-| `--output` | Output directory (default: `output_patents`) |
-| `--recursive` | Recursively search subfolders for PDF files |
+| `--input` | Input folder containing documents (aliases: `--sharepoint`, `--talks`) |
+| `--output` | Output directory for markdown files |
+| `--single` | Process a single file instead of a folder |
+| `--recursive` | Recursively search subfolders for files |
 | `--no-skip` | Reprocess files that already exist (default: skip existing) |
-| `--no-vision` | Text-only extraction (skip AI analysis) |
-| `--claims-only` | Extract only the claims section |
-| `--max-figure-pages` | Limit figure pages analyzed |
-| `--budget` | Max API calls per patent (default: 200) |
-| `--ocr-engine` | OCR engine: `auto`, `tesseract`, or `vision` |
-| `--naming` | Filename scheme: `default`, `detailed`, or `dated` |
+| `--naming` | Output filename scheme (options vary per pipeline) |
 | `--verbose` | Enable debug logging |
 
-### Talk Pipeline
-
-| Flag | Description |
-|------|-------------|
-| `--talks` | Folder containing talk PDFs |
-| `--single` | Process a single talk PDF |
-| `--metadata` | Excel file with abstract metadata |
-| `--output` | Output directory (default: `output_talks`) |
-| `--no-skip` | Reprocess already-converted files |
-
-### Presentation Pipeline
-
-| Flag | Description |
-|------|-------------|
-| `--input` | Folder containing PPTX/PDF presentations |
-| `--single` | Process a single presentation file |
-| `--output` | Output directory (default: `output_presentations`) |
-| `--recursive` | Also scan subfolders for presentations |
-| `--no-skip` | Reprocess already-converted files |
-| `--no-vision` | Text-only extraction (no API calls) |
-| `--naming` | Filename scheme: `default`, `dated`, or `classified` |
-| `--verbose` | Enable debug logging |
+Each pipeline also has specialized flags — see the pipeline-specific documentation for full options:
+- [Poster Pipeline flags](README_Posters.md#command-line-interface) — `--metadata`, `--force-ocr`, `--conference`, `--col-*`
+- [Patent Pipeline flags](README_Patents.md#command-line-interface) — `--no-vision`, `--claims-only`, `--budget`, `--ocr-engine`
+- [Talk Pipeline flags](README_Talks.md#command-line-interface) — `--metadata`
+- [Presentation Pipeline flags](README_Presentations.md#command-line-interface) — `--no-vision`
 
 ## Output Structure
 

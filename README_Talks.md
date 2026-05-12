@@ -75,11 +75,14 @@ python talk_pipeline.py [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--talks` | `C:\Users\...\Conference Platform - Talks` | Folder containing talk PDFs |
+| `--input` / `--talks` | *(required)* | Folder containing talk PDFs |
 | `--metadata` | `test_poster\AACR2026_Abstracts.xlsx` | Excel file with abstract metadata |
 | `--output` | `output_talks` | Output directory for markdown files |
 | `--single` | *(none)* | Process a single PDF file only |
+| `--recursive` | `False` | Recursively search subfolders for PDF files |
 | `--no-skip` | `False` | Reprocess files that already exist |
+| `--naming` | `default` | Filename scheme: `default`, `detailed`, or `dated` |
+| `--verbose` | `False` | Enable debug logging |
 
 ### Python API
 
@@ -89,7 +92,9 @@ from talk_pipeline import TalkPipeline
 pipeline = TalkPipeline(
     talks_folder="path/to/talks",
     metadata_excel="path/to/AACR2026_Abstracts.xlsx",
-    output_dir="output_talks"
+    output_dir="output_talks",
+    recursive=False,
+    naming="default"
 )
 ```
 
