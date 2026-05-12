@@ -33,16 +33,25 @@ Automated extraction and analysis of scientific conference posters (PDF) using A
 # 1. Activate environment
 conda activate ds_env
 
-# 2. Process all posters (uses default paths)
-python poster_pipeline.py --sharepoint "path/to/sharepoint_folder" --metadata "path/to/metadata.xlsx"
+# 2. Process all posters with metadata
+python poster_pipeline.py --sharepoint "path/to/poster_pdfs" --metadata "path/to/metadata.xlsx"
 
-# 3. Process a single poster
-python poster_pipeline.py --sharepoint "test_poster" --metadata "test_poster/AACR26_Selected_Apr13.xlsx" --single "test_poster/160.pdf"
+# 3. Process all posters without metadata
+python poster_pipeline.py --sharepoint "path/to/poster_pdfs"
 
-# 4. Custom output directory
+# 4. Process a single poster
+python poster_pipeline.py --sharepoint "test_poster" --metadata "metadata.xlsx" --single "test_poster/160.pdf"
+
+# 5. Standardized filenames (Poster_Author_Conference_Year_Title.md)
+python poster_pipeline.py --sharepoint "posters" --naming standardized --conference AACR --year 2026
+
+# 6. Custom metadata format (different sheet and column names)
+python poster_pipeline.py --sharepoint "posters" --metadata "custom.xlsx" --sheet "Abstracts" --col-title "Abstract Title" --col-authors "Speaker"
+
+# 7. Custom output directory
 python poster_pipeline.py --sharepoint "posters" --metadata "metadata.xlsx" --output "output_posters"
 
-# 5. Reprocess all (ignore previously generated files)
+# 8. Reprocess all (ignore previously generated files)
 python poster_pipeline.py --sharepoint "posters" --metadata "metadata.xlsx" --no-skip
 ```
 
@@ -76,7 +85,7 @@ python poster_pipeline.py [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--sharepoint` | *(required)* | Folder containing PDF posters |
-| `--metadata` | *(required)* | Excel file with poster metadata |
+| `--metadata` | *(optional)* | Excel file with poster metadata (enriches output) |
 | `--output` | `output` | Output directory for markdown files |
 | `--single` | *(none)* | Process a single PDF file only |
 | `--force-ocr` | `False` | Force OCR even if native text extraction works |
@@ -84,16 +93,68 @@ python poster_pipeline.py [OPTIONS]
 | `--ocr-dpi` | `200` | DPI for Tesseract OCR |
 | `--no-detailed-analysis` | `False` | Skip Stage 2 figure analysis (faster) |
 | `--recursive` | `False` | Recursively search subfolders for PDF files |
+| `--naming` | `default` | Filename scheme: `default` or `standardized` |
+| `--conference` | *(none)* | Conference name for standardized naming (e.g., AACR) |
+| `--year` | *(none)* | Year for standardized naming (e.g., 2026) |
+
+**Metadata Column Configuration** — only needed when the Excel file uses different column names:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--sheet` | `Full_Program_Copy` | Excel sheet name to read |
+| `--col-poster-number` | `Presentation Number,Poster Number,...` | Comma-separated columns for poster number matching |
+| `--col-title` | `Presentation Title` | Title column |
+| `--col-authors` | `authors` | Authors column |
+| `--col-institution` | `institution` | Institution/affiliation column |
+| `--col-session-number` | `Session Number` | Session number column |
+| `--col-session-title` | `Session Title` | Session title column |
+| `--col-session-type` | `Session Type Name` | Session type column |
+| `--col-day` | `Day` | Day/date column |
+| `--col-session-start` | `Session Start` | Session start time column |
+| `--col-session-end` | `Session End` | Session end time column |
+| `--col-location` | `Location` | Location column |
+| `--col-covered-by` | `Covered by` | Coverage person column |
+| `--col-interested` | `Interested Colleagues` | Interested people column |
 
 ### Python API
 
 ```python
 from poster_pipeline import PosterPipeline
 
+# With metadata
 pipeline = PosterPipeline(
     sharepoint_folder="path/to/posters",
     metadata_excel="path/to/AACR26_Selected_Apr13.xlsx",
     output_dir="output"
+)
+
+# Without metadata
+pipeline = PosterPipeline(
+    sharepoint_folder="path/to/posters",
+    output_dir="output"
+)
+
+# With standardized naming
+pipeline = PosterPipeline(
+    sharepoint_folder="path/to/posters",
+    output_dir="output",
+    naming="standardized",
+    conference="AACR",
+    year="2026"
+)
+
+# With custom metadata column mapping
+pipeline = PosterPipeline(
+    sharepoint_folder="path/to/posters",
+    metadata_excel="path/to/custom_export.xlsx",
+    output_dir="output",
+    sheet="Abstracts",
+    column_overrides={
+        "poster_number": ["ID", "Abstract ID"],
+        "title": "Abstract Title",
+        "authors": "Speaker",
+        "institution": "Organization",
+    }
 )
 ```
 
@@ -133,8 +194,9 @@ The pipeline handles single-page scientific poster PDFs using a multi-stage appr
 
 - Extracts poster number from filename (e.g., `160.pdf` → "160", `LB197.pdf` → "LB197")
 - Requires at least 2 digits to avoid false matches on gene names (B7, CD3)
-- Verifies candidate number exists in metadata before accepting
-- **Title-based fallback**: If regex extraction fails, matches filename against metadata `Presentation Title` using:
+- When metadata is available: verifies candidate number exists in metadata before accepting
+- When metadata is unavailable: accepts all regex-matched candidates directly
+- **Title-based fallback** (requires metadata): If regex extraction fails, matches filename against metadata `Presentation Title` using:
   - Trailing number pattern (e.g., `Some Title - 348.pdf`)
   - Exact substring matching against metadata titles
   - Fuzzy matching (SequenceMatcher, threshold ≥0.75)
@@ -237,11 +299,18 @@ output/
 └── ...
 ```
 
-### Filename Convention
+### Naming Schemes
 
-```
-poster_{poster_number}.md
-```
+| Scheme | Flag | Pattern | Example |
+|--------|------|---------|---------|
+| Default | `--naming default` | `poster_{NUM}.md` | `poster_160.md` |
+| Standardized | `--naming standardized` | `Poster_{Author}_{Conference}_{Year}_{Title}.md` | `Poster_Ziblat_AACR_2026_FGFR3_impairs_DC1sCD8_T_cell.md` |
+
+Standardized naming extracts:
+- **Author** — first author's last name (from Vision AI poster analysis, or metadata if available)
+- **Conference** — from `--conference` CLI argument
+- **Year** — from `--year` CLI argument (falls back to metadata session date if available)
+- **Title** — first 5 words of the poster title, sanitized for filesystem safety
 
 ### Markdown Structure
 
@@ -346,24 +415,42 @@ Complete extracted text for reference...
 
 ---
 
-## Excel Metadata Requirements
+## Excel Metadata (Optional)
 
-The Excel file should contain a sheet named `Full_Program_Copy` with columns such as:
+Metadata is **optional**. Without it, the pipeline still extracts all content from the poster image using Vision AI — including title, authors, and affiliation. When no metadata file is provided, the pipeline logs:
 
-| Column | Description |
-|--------|-------------|
-| Presentation Number / Poster Number / Abstract Number | Poster identifier (searched across multiple columns) |
-| Presentation Title | Used for title-based fuzzy matching when filename is not numeric |
-| Interested Colleagues | Names of colleagues who flagged this poster |
-| Covered by | Assigned reviewer |
-| Session Number | Session identifier |
-| Session Title | Session name |
-| Session Type Name | e.g., "Poster Session" |
-| Day | Presentation date |
-| Session Start / Session End | Session time window |
-| Location | Physical location |
+> *Unfortunately, no additional metadata is available for the poster extraction. Poster extraction proceeds without additional information.*
 
-**Matching logic**: The pipeline extracts a poster number from the filename, then searches across Presentation Number, Poster Number, Abstract Number, and Session Number columns. Falls back to full-row scan if no match found. For title-based filenames, uses substring and fuzzy matching against `Presentation Title` (threshold ≥0.75).
+When metadata **is** provided, the pipeline enriches the output with session info, interested colleagues, and scheduling data. By default, the pipeline reads a sheet named `Full_Program_Copy` and expects these columns:
+
+| Column (default name) | Role | Description |
+|--------|------|-------------|
+| Presentation Number / Poster Number / Abstract Number / Session Number | `poster_number` | Poster identifier (searched across multiple columns) |
+| Presentation Title | `title` | Used for title-based fuzzy matching when filename is not numeric |
+| authors | `authors` | Poster authors |
+| institution | `institution` | Affiliation/institution |
+| Interested Colleagues | `interested` | Names of colleagues who flagged this poster |
+| Covered by | `covered_by` | Assigned reviewer |
+| Session Number | `session_number` | Session identifier |
+| Session Title | `session_title` | Session name |
+| Session Type Name | `session_type` | e.g., "Poster Session" |
+| Day | `day` | Presentation date |
+| Session Start | `session_start` | Start time |
+| Session End | `session_end` | End time |
+| Location | `location` | Physical location |
+
+**Flexible metadata**: If your Excel file uses different column names or a different sheet, use `--sheet` and `--col-*` flags to remap them. Only specify columns that differ from the defaults — any column not present in the spreadsheet is silently skipped:
+
+```bash
+python poster_pipeline.py --sharepoint posters \
+  --metadata export.xlsx \
+  --sheet "Abstracts" \
+  --col-title "Abstract Title" \
+  --col-authors "Speaker" \
+  --col-poster-number "ID,Number"
+```
+
+**Matching logic**: The pipeline extracts a poster number from the filename, then searches across the configured poster number columns. Falls back to full-row scan if no match found. For title-based filenames, uses substring and fuzzy matching against the configured title column (threshold ≥0.75).
 
 ---
 

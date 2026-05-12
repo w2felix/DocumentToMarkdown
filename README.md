@@ -1,8 +1,8 @@
 # DocumentToMarkdown
 
-Convert scientific PDFs into structured, searchable markdown using AI-powered vision analysis.
+Convert scientific documents into structured, searchable markdown using AI-powered vision analysis.
 
-Built for pharmaceutical research — handles conference posters, patent filings, and presentation slides out of the box.
+Built for pharmaceutical research — handles conference posters, patent filings, presentation slides, and corporate presentations (PPTX + PDF) out of the box.
 
 ## What It Does
 
@@ -11,6 +11,7 @@ Built for pharmaceutical research — handles conference posters, patent filings
 | **Poster** | Conference poster PDFs | Structured markdown with figures, sections, and metadata |
 | **Patent** | Patent filing PDFs (WO/EP/US) | Claims, chemical structures, SMILES, executive summaries |
 | **Talk** | Slide-based presentation PDFs | Slide-by-slide extraction with narrative summaries |
+| **Presentation** | PPTX + PDF presentations | Native text extraction, action items, chemical structures |
 
 Each pipeline produces a self-contained `.md` file with YAML frontmatter, making the output easy to search, filter, and integrate into knowledge bases.
 
@@ -43,7 +44,12 @@ Restart your terminal after setting these.
 
 **Posters:**
 ```bash
+# with metadata
 python poster_pipeline.py --sharepoint "path/to/poster_pdfs" --metadata "abstracts.xlsx"
+# without metadata
+python poster_pipeline.py --sharepoint "path/to/poster_pdfs"
+# standardized filenames
+python poster_pipeline.py --sharepoint "path/to/poster_pdfs" --naming standardized --conference AACR --year 2026
 ```
 
 **Patents:**
@@ -51,6 +57,8 @@ python poster_pipeline.py --sharepoint "path/to/poster_pdfs" --metadata "abstrac
 python patent_pipeline.py --input "path/to/patent_pdfs"
 # or a single file:
 python patent_pipeline.py --single "path/to/WO2024123456.pdf"
+# recursive scan with detailed naming:
+python patent_pipeline.py --input "path/to/patent_pdfs" --recursive --naming detailed
 ```
 
 **Talks:**
@@ -60,6 +68,15 @@ python talk_pipeline.py --talks "path/to/talk_pdfs" --metadata "abstracts.xlsx"
 python talk_pipeline.py --single "path/to/talk.pdf"
 ```
 
+**Presentations:**
+```bash
+python presentation_pipeline.py --input "path/to/presentations"
+# text-only (no API calls):
+python presentation_pipeline.py --input "path/to/presentations" --no-vision
+# single file with dated naming:
+python presentation_pipeline.py --single "path/to/file.pptx" --naming dated
+```
+
 ## Pipeline Options
 
 ### Poster Pipeline
@@ -67,13 +84,18 @@ python talk_pipeline.py --single "path/to/talk.pdf"
 | Flag | Description |
 |------|-------------|
 | `--sharepoint` | Folder containing poster PDFs (required) |
-| `--metadata` | Excel file with abstract metadata (required) |
+| `--metadata` | Excel file with poster metadata (optional, enriches output) |
 | `--output` | Output directory (default: `output`) |
 | `--single` | Process a single PDF file |
 | `--recursive` | Search subfolders for PDFs |
 | `--no-skip` | Reprocess already-converted files |
 | `--force-ocr` | Force OCR even when native text works |
 | `--no-detailed-analysis` | Skip two-stage figure analysis (faster) |
+| `--naming` | Filename scheme: `default` or `standardized` |
+| `--conference` | Conference name for standardized naming (e.g., AACR) |
+| `--year` | Year for standardized naming (e.g., 2026) |
+| `--sheet` | Excel sheet name (default: `Full_Program_Copy`) |
+| `--col-*` | Remap metadata columns — see [Poster Pipeline docs](README_Posters.md#excel-metadata-optional) |
 
 ### Patent Pipeline
 
@@ -82,10 +104,15 @@ python talk_pipeline.py --single "path/to/talk.pdf"
 | `--input` | Folder containing patent PDFs |
 | `--single` | Process a single patent PDF |
 | `--output` | Output directory (default: `output_patents`) |
+| `--recursive` | Recursively search subfolders for PDF files |
+| `--no-skip` | Reprocess files that already exist (default: skip existing) |
 | `--no-vision` | Text-only extraction (skip AI analysis) |
 | `--claims-only` | Extract only the claims section |
 | `--max-figure-pages` | Limit figure pages analyzed |
-| `--skip-existing` | Skip already-processed patents |
+| `--budget` | Max API calls per patent (default: 200) |
+| `--ocr-engine` | OCR engine: `auto`, `tesseract`, or `vision` |
+| `--naming` | Filename scheme: `default`, `detailed`, or `dated` |
+| `--verbose` | Enable debug logging |
 
 ### Talk Pipeline
 
@@ -96,6 +123,19 @@ python talk_pipeline.py --single "path/to/talk.pdf"
 | `--metadata` | Excel file with abstract metadata |
 | `--output` | Output directory (default: `output_talks`) |
 | `--no-skip` | Reprocess already-converted files |
+
+### Presentation Pipeline
+
+| Flag | Description |
+|------|-------------|
+| `--input` | Folder containing PPTX/PDF presentations |
+| `--single` | Process a single presentation file |
+| `--output` | Output directory (default: `output_presentations`) |
+| `--recursive` | Also scan subfolders for presentations |
+| `--no-skip` | Reprocess already-converted files |
+| `--no-vision` | Text-only extraction (no API calls) |
+| `--naming` | Filename scheme: `default`, `dated`, or `classified` |
+| `--verbose` | Enable debug logging |
 
 ## Output Structure
 
@@ -112,9 +152,7 @@ Example output location:
 output/
 ├── poster_1234.md
 ├── poster_1235.md
-└── figures/
-    ├── poster_1234_fig1.jpg
-    └── ...
+└── quality_log.txt
 
 output_patents/
 ├── patent_WO2024123456A1.md
@@ -123,59 +161,72 @@ output_patents/
 output_talks/
 ├── talk_04_ED03_Bunne_toward_virtual_patients.md
 └── processing_log.txt
+
+output_presentations/
+├── presentation_ru_onc_operations_update_darmstadt.md
+└── presentation_caris_discovery_non_con_apr.md
 ```
 
 ## Pipeline Comparison
 
 ### At a Glance
 
-| | Poster | Patent | Talk |
-|---|--------|--------|------|
-| **Input** | Single-page poster PDF | Multi-page patent PDF (50–300+ pages) | Multi-slide presentation PDF (screenshots) |
-| **Output** | Sections (Methods, Results, Conclusions) | Patent sections + claims + chemical data | Slide-by-slide content + narrative summary |
-| **Text extraction** | Native PDF + OCR + Vision AI | Native PDF + selective Vision AI for garbled pages | OCR + Vision AI only (no extractable text) |
-| **Metadata source** | Excel spreadsheet (required) | Extracted from the PDF itself | Excel spreadsheet (optional) |
-| **Quality gate** | Yes — skips FAIR/POOR | No — all patents saved | No — all talks saved |
+| | Poster | Patent | Talk | Presentation |
+|---|--------|--------|------|--------------|
+| **Input** | Single-page poster PDF | Multi-page patent PDF (50–300+ pages) | Multi-slide presentation PDF (screenshots) | PPTX or PDF slide decks |
+| **Output** | Sections (Methods, Results, Conclusions) | Patent sections + claims + chemical data | Slide-by-slide content + narrative summary | Slide content + action items + metrics |
+| **Text extraction** | Native PDF + OCR + Vision AI | Native PDF + Tesseract OCR (scanned) + selective Vision AI for garbled pages | OCR + Vision AI only (no extractable text) | Native PPTX (python-pptx) or PyMuPDF + pdfplumber tables + Vision AI fallback |
+| **Metadata source** | Excel spreadsheet (optional) | Extracted from the PDF itself | Excel spreadsheet (optional) | Extracted from the file itself |
+| **Quality gate** | Yes — skips FAIR/POOR | No — all patents saved | No — all talks saved | No — all presentations saved |
 
 ### Performance & Cost
 
-| | Poster | Patent | Talk |
-|---|--------|--------|------|
-| **Processing time** | 1.5–4 min | 2–3 min (text+vision), ~15s text-only | 1.5–4 min |
-| **API calls per doc** | 4 + N figures | 10–48 (scales with figure pages) | 4–9 (scales with slide count) |
-| **Token usage per doc** | ~30K–60K | ~40K–120K | ~18K–35K |
-| **Vision AI pages** | All pages (mandatory) | ~10% of pages (selective) | All slides (mandatory) |
-| **Text-only mode** | No | Yes (`--no-vision`) | No |
-| **Claims-only mode** | No | Yes (`--claims-only`, ~5s) | No |
-| **Concurrency** | Up to 5 figure workers | Up to 3 batch workers | Up to 5 batch workers |
+| | Poster | Patent | Talk | Presentation |
+|---|--------|--------|------|--------------|
+| **Processing time** | 1.5–4 min | 2–3 min (text+vision), 3–5 min (scanned+Tesseract), ~15s text-only | 1.5–4 min | <1s text-only, 30–90s with vision |
+| **API calls per doc** | 4 + N figures | 10–48 (text-native), 8–35 (scanned+Tesseract) | 4–9 (scales with slide count) | 1–3 (smart gating), 0 text-only |
+| **Token usage per doc** | ~30K–60K | ~40K–120K | ~18K–35K | ~8K–20K |
+| **Vision AI pages** | All pages (mandatory) | ~10% of pages (selective) | All slides (mandatory) | Smart gating: only when visual content detected (requires PowerPoint for PPTX) |
+| **Text-only mode** | No | Yes (`--no-vision`) | No | Yes (`--no-vision`) |
+| **Claims-only mode** | No | Yes (`--claims-only`, ~5s) | No | No |
+| **Concurrency** | Up to 5 figure workers | Up to 3 batch workers | Up to 5 batch workers | Sequential |
 
 ### Unique Capabilities
 
-| Capability | Poster | Patent | Talk |
-|------------|:------:|:------:|:----:|
-| Two-stage figure analysis | x | | |
-| Chemical structure extraction (SMILES) | | x | |
-| Claims dependency tree | | x | |
-| Semantic classification (target, mechanism, modality) | | x | |
-| Text quality scoring & auto-repair | | x | |
-| OCR pre-pass as RAG context | x | | x |
-| Abstract matching from metadata | x | | x |
-| Executive summary | x | x | x |
-| Quality scoring | x | x | x |
+| Capability | Poster | Patent | Talk | Presentation |
+|------------|:------:|:------:|:----:|:------------:|
+| Two-stage figure analysis | x | | | |
+| Chemical structure extraction (SMILES) | | x | | x |
+| Claims dependency tree | | x | | |
+| Semantic classification (target, mechanism, modality) | | x | | |
+| Hybrid OCR (Tesseract + Vision AI) | | x | | |
+| Text quality scoring & auto-repair | | x | | |
+| OCR pre-pass as RAG context | x | | x | |
+| Abstract matching from metadata | x | | x | |
+| Native PPTX text extraction | | | | x |
+| Smart Vision AI gating (skip when not needed) | | | | x |
+| Language detection (EN/DE) + English output | | | | x |
+| Classification detection (3-signal) | | | | x |
+| Action items & metrics extraction | | | | x |
+| Conditional summary (content-type aware) | | | | x |
+| Standardized naming schemes | x | x | | x |
+| Executive summary | x | x | x | x |
+| Quality scoring | x | x | x | x |
 
 ### When to Use Which
 
 - **Poster** — single-page conference posters with figures, methods, and results sections
 - **Patent** — multi-page patent filings (WIPO, EPO, USPTO) with claims, chemical structures, and experimental data
 - **Talk** — slide-based presentations captured as PDF screenshots (no extractable text)
+- **Presentation** — PPTX or PDF slide decks with native text (corporate meetings, scientific presentations, agendas); supports English and German content
 
 ## How It Works
 
-1. **PDF Rendering** — pages are rendered to images using PyMuPDF
-2. **Text Extraction** — native text extraction via pdfplumber, with OCR fallback (Tesseract)
-3. **Vision AI** — Claude analyzes page images for figures, chemical structures, and garbled text
+1. **Text Extraction** — native text via PyMuPDF/pdfplumber/python-pptx, with OCR fallback (Tesseract) for posters/talks/scanned patents
+2. **Page Rendering** — pages rendered to images using PyMuPDF (PDFs) or PowerPoint COM (PPTX) when Vision AI is needed
+3. **Vision AI** — Claude analyzes page images for figures, chemical structures, and garbled text (smart gating skips this when not needed)
 4. **Structuring** — extracted content is parsed into logical sections
-5. **Summarization** — AI generates executive summaries and key findings
+5. **Summarization** — AI generates executive summaries and key findings (always in English)
 6. **Quality Scoring** — automated scoring flags documents that may need manual review
 
 ## Documentation
@@ -186,10 +237,13 @@ output_talks/
 | [Poster Pipeline](README_Posters.md) | Deep dive — architecture, processing stages, figure analysis, quality scoring |
 | [Patent Pipeline](README_Patents.md) | Deep dive — claims parsing, SMILES extraction, text quality repair, semantic classification |
 | [Talk Pipeline](README_Talks.md) | Deep dive — slide extraction, OCR pre-pass, summary generation, batch processing |
+| [Presentation Pipeline](README_Presentations.md) | Deep dive — PPTX/PDF extraction, classification detection, action items, naming schemes |
 
 ## Requirements
 
 - Python 3.11+ (via Conda)
-- Tesseract OCR
+- Tesseract OCR (poster/talk/patent pipelines — required for poster/talk, optional for patent scanned PDFs)
+- python-pptx, PyMuPDF, pdfplumber (presentation pipeline)
+- Microsoft PowerPoint (optional — enables Vision AI for PPTX slide rendering)
 - Anthropic API access (Claude Sonnet 4.6)
 - Windows (uses Windows Registry for credential loading; adaptable to other OS)

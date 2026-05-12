@@ -28,10 +28,13 @@ scripts/claude-*-cwd
 output/
 output_patents/
 output_talks/
+output_presentations/
+test_output_*/
 figures/
 
-# Test data (PDFs, Excel)
+# Test data (PDFs, Excel, PPTX)
 test_poster/
+test_presentation/
 *.pdf
 *.pptx
 *.xlsx

@@ -62,6 +62,13 @@ class PatentPipeline:
     QUALITY_GOOD_THRESHOLD = 5.5
     QUALITY_FAIR_THRESHOLD = 4.0
 
+    # Figure page limits
+    DEFAULT_MAX_FIGURE_PAGES = 50
+    MAX_SMILES_REFINEMENT = 50
+
+    # Budget / cost controls
+    DEFAULT_BUDGET_CAP = 200
+
     # Chemical structure refinement
     CHEMICAL_STRUCTURE_DPI = 250
     MAX_IMAGE_DIMENSION_CHEMICAL = 2048
@@ -71,9 +78,15 @@ class PatentPipeline:
     TEXT_QUALITY_GOOD_THRESHOLD = 0.65
     TEXT_QUALITY_GARBLED_THRESHOLD = 0.30
     MAX_VISION_TEXT_PAGES = 30
-    VISION_DPI_TEXT_ENHANCEMENT = 300
-    MAX_IMAGE_DIMENSION_TEXT = 2048
-    PAGES_PER_VISION_TEXT_BATCH = 2
+    VISION_DPI_TEXT_ENHANCEMENT = 250
+    MAX_IMAGE_DIMENSION_TEXT = 1568
+    PAGES_PER_VISION_TEXT_BATCH = 4
+
+    # Tesseract OCR configuration (local, free, fast)
+    TESSERACT_DPI = 200
+    TESSERACT_BATCH_SIZE = 20
+    TESSERACT_CONFIG = '--psm 6 --oem 1'
+    TESSERACT_MIN_CHARS = 50
 
     # Known encoding errors in pharma/scientific PDF text (ligature decomposition)
     ENCODING_FIXES = {
@@ -94,7 +107,6 @@ class PatentPipeline:
         'coniugation': 'conjugation',
         'Bioconiugate': 'Bioconjugate',
         'surpnsingly': 'surprisingly',
-        'seventy': 'severity',
         'particuiar': 'particular',
         'particuiariy': 'particularly',
         'cieavabie': 'cleavable',
@@ -137,7 +149,7 @@ class PatentPipeline:
         'technical_field': r'(?:Technical\s+[Ff]ield|TECHNICAL\s+FIELD|Field\s+of\s+(?:the\s+)?[Ii]nvention|FIELD\s+OF\s+(?:THE\s+)?INVENTION)',
         'background': r'(?:Background|BACKGROUND|Prior\s+[Aa]rt|PRIOR\s+ART|Background\s+of\s+the\s+[Ii]nvention)',
         'summary': r'(?:Summary|SUMMARY|Summary\s+of\s+(?:the\s+)?[Ii]nvention|SUMMARY\s+OF\s+(?:THE\s+)?INVENTION)',
-        'claims': r'(?:Claims|CLAIMS|What\s+[Ii]s\s+[Cc]laimed)',
+        'claims': r'(?:Claims|CLAIMS|[Ww]hat\s+[Ii]s\s+[Cc]laimed|WHAT\s+IS\s+CLAIMED)',
         'detailed_description': r'(?:Detailed\s+[Dd]escription|DETAILED\s+DESCRIPTION|Description\s+of\s+(?:the\s+)?[Ee]mbodiments)',
         'examples': r'(?:Examples?\s|EXAMPLES?\s|Experimental|EXPERIMENTAL)',
         'drawings': r'(?:Brief\s+[Dd]escription\s+of\s+(?:the\s+)?[Dd]rawings|BRIEF\s+DESCRIPTION\s+OF\s+(?:THE\s+)?DRAWINGS|Legends?\s+of\s+(?:the\s+)?[Ff]igures)',
@@ -158,12 +170,84 @@ class PatentPipeline:
         re.IGNORECASE
     )
 
-    def __init__(self, output_dir: str = "output_patents"):
+    NAMING_SCHEMES = {
+        'default': 'patent_{patent_id}',
+        'detailed': 'patent_{patent_id}_{applicant}_{title_slug}',
+        'dated': '{pub_date}_{patent_id}_{title_slug}',
+    }
+
+    def __init__(self, output_dir: str = "output_patents", budget: int = 200,
+                 ocr_engine: str = "auto", naming: str = "default",
+                 recursive: bool = False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.quality_log_path = self.output_dir / "quality_log.txt"
         self._client = None
         self._existing_files = set(f.stem for f in self.output_dir.glob("*.md"))
+        self._budget_cap = budget if budget > 0 else None
+        self._api_call_count = 0
+        self._ocr_engine = ocr_engine
+        self._naming = naming
+        self._recursive = recursive
+        self._tesseract_available = self._check_tesseract_available()
+
+    def _check_tesseract_available(self) -> bool:
+        """Check if Tesseract binary is installed and accessible."""
+        if self._ocr_engine == 'vision':
+            return False
+        try:
+            import pytesseract
+            pytesseract.get_tesseract_version()
+            return True
+        except Exception:
+            if self._ocr_engine == 'tesseract':
+                logger.error("Tesseract not found but --ocr-engine=tesseract was specified")
+            else:
+                logger.info("Tesseract not available — will use Vision AI for OCR")
+            return False
+
+    def _generate_output_filename(self, patent_id: str, bib: Dict) -> str:
+        """Generate output filename based on naming scheme."""
+        if self._naming == 'default':
+            return f"patent_{patent_id}"
+
+        # Build template variables
+        title = bib.get('title', '')
+        title_slug = re.sub(r'[^\w\s]', '', title.lower()).split()[:5]
+        title_slug = '_'.join(title_slug) if title_slug else 'untitled'
+
+        applicants = bib.get('applicants', [])
+        applicant = ''
+        if applicants:
+            # First applicant, take first meaningful word (skip "THE", "A")
+            raw = str(applicants[0]).strip()
+            words = [w for w in raw.split() if w.upper() not in ('THE', 'A', 'AN', 'INC.', 'INC', 'LTD', 'LTD.', 'CO.', 'CORP.', 'CORPORATION')]
+            applicant = re.sub(r'[^\w]', '', words[0]) if words else 'unknown'
+
+        pub_date = bib.get('publication_date', '')
+        # Normalize date to YYYY-MM-DD format
+        date_match = re.search(r'(\d{1,2})\s+(\w+)\s+(\d{4})', pub_date)
+        if date_match:
+            day, month_str, year = date_match.groups()
+            months = {'january': '01', 'february': '02', 'march': '03', 'april': '04',
+                      'may': '05', 'june': '06', 'july': '07', 'august': '08',
+                      'september': '09', 'october': '10', 'november': '11', 'december': '12'}
+            month_num = months.get(month_str.lower(), '00')
+            pub_date_fmt = f"{year}-{month_num}-{day.zfill(2)}"
+        else:
+            pub_date_fmt = pub_date.replace(' ', '-') if pub_date else 'nodate'
+
+        template = self.NAMING_SCHEMES.get(self._naming, self.NAMING_SCHEMES['default'])
+        filename = template.format(
+            patent_id=patent_id,
+            applicant=applicant,
+            title_slug=title_slug,
+            pub_date=pub_date_fmt
+        )
+        # Sanitize: remove any remaining invalid filename characters
+        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+        filename = re.sub(r'\s+', '_', filename)
+        return filename
 
     # ─── Shared Utilities ──────────────────────────────────────────────────
 
@@ -191,7 +275,45 @@ class PatentPipeline:
             self._client = Anthropic(api_key=api_key)
         return self._client
 
-    def encode_image_to_base64(self, image, format="JPEG", max_dimension=None) -> Tuple[Optional[str], Optional[str]]:
+    def _track_api_call(self, count: int = 1) -> bool:
+        """Track API calls and check budget. Returns False if budget exceeded."""
+        self._api_call_count += count
+        if self._budget_cap and self._api_call_count > self._budget_cap:
+            logger.warning(f"  BUDGET EXCEEDED: {self._api_call_count}/{self._budget_cap} API calls")
+            return False
+        return True
+
+    def _budget_remaining(self) -> int:
+        """Return remaining API calls before budget is hit, or 999 if unlimited."""
+        if not self._budget_cap:
+            return 999
+        return max(0, self._budget_cap - self._api_call_count)
+
+    def _estimate_and_log_cost(self, page_data: List[Dict], no_vision: bool) -> Dict[str, int]:
+        """Estimate API calls needed and log. Returns per-stage estimates."""
+        figure_pages = sum(1 for p in page_data if p['classification'] == 'FIGURE_PAGE')
+        text_heavy = sum(1 for p in page_data if p['classification'] == 'TEXT_HEAVY')
+        effective_fig = min(figure_pages, self.DEFAULT_MAX_FIGURE_PAGES)
+
+        est = {
+            'cover_vision': 0 if no_vision else 1,
+            'text_enhancement': 0,
+            'figure_analysis': 0 if no_vision else -(-effective_fig // self.PAGES_PER_VISION_BATCH),
+            'key_data': 0 if no_vision else 1,
+            'smiles_refinement': 0,
+            'summaries': 0 if no_vision else 1,
+        }
+        est['total'] = sum(est.values())
+
+        logger.info(f"  API call estimate: ~{est['total']} calls "
+                   f"(figures: {est['figure_analysis']}, other: {est['total'] - est['figure_analysis']})")
+        if self._budget_cap:
+            logger.info(f"  Budget: {self._budget_cap} calls "
+                       f"(remaining: {self._budget_remaining()})")
+        return est
+
+    def encode_image_to_base64(self, image, format="JPEG", max_dimension=None,
+                              quality: int = 85) -> Tuple[Optional[str], Optional[str]]:
         if max_dimension is None:
             max_dimension = self.MAX_IMAGE_DIMENSION
         try:
@@ -203,7 +325,8 @@ class PatentPipeline:
             if image.mode == 'RGBA':
                 image = image.convert('RGB')
             buffered = BytesIO()
-            image.save(buffered, format=format, quality=85 if format == "JPEG" else None)
+            image.save(buffered, format=format,
+                       quality=quality if format == "JPEG" else None)
             img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
             return img_base64, f"image/{format.lower()}"
         except Exception as e:
@@ -678,6 +801,344 @@ Start with ===PAGE {page_numbers[0] + 1}==="""
 
         return 'TEXT_HEAVY'
 
+    # ─── Stage 0.5: Image-Only PDF Detection & OCR ────────────────────────
+
+    def _detect_image_only_pdf(self, pdf_info: Dict) -> bool:
+        """Detect if PDF is image-only (scanned) with no extractable text."""
+        classifications = pdf_info['classifications']
+        total = pdf_info['total_pages']
+        text_heavy = classifications.get('TEXT_HEAVY', 0)
+        return text_heavy == 0 and total > 10
+
+    def _sample_page_types_vision(self, pdf_path: Path, page_data: List[Dict]) -> Dict[str, List[int]]:
+        """Sample evenly-spaced pages to classify as text vs figure using Vision AI."""
+        total = len(page_data)
+        sample_indices = [total // 6, 2 * total // 6, 3 * total // 6,
+                          4 * total // 6, 5 * total // 6]
+        sample_indices = [i for i in sample_indices if 0 < i < total]
+
+        client = self.get_anthropic_client()
+        if not client:
+            return {'text_pages': list(range(1, total)), 'figure_pages': []}
+
+        images = self.render_pages_to_images(pdf_path, sample_indices, dpi=150)
+        content = []
+        valid_indices = []
+        for idx in sample_indices:
+            if idx not in images:
+                continue
+            img_base64, media_type = self.encode_image_to_base64(images[idx], max_dimension=1024)
+            del images[idx]
+            if not img_base64:
+                continue
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": img_base64}
+            })
+            content.append({"type": "text", "text": f"[Page {idx + 1}]"})
+            valid_indices.append(idx)
+
+        if not content:
+            return {'text_pages': list(range(1, total)), 'figure_pages': []}
+
+        content.append({"type": "text", "text": f"""Classify each page shown above.
+For each page, determine if it is:
+- "text": A page primarily containing typed/printed text (patent description, claims, definitions)
+- "figure": A page primarily containing diagrams, chemical structures, graphs, or drawings
+
+Return ONLY a JSON array like: [{{"page": 55, "type": "text"}}, {{"page": 111, "type": "figure"}}]"""})
+
+        try:
+            self._track_api_call()
+            response = client.messages.create(
+                model=self.VISION_MODEL,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": content}]
+            )
+            results = self.parse_json_response(response.content[0].text)
+            if results:
+                return self._infer_page_boundaries(results, valid_indices, total)
+        except Exception as e:
+            logger.error(f"  Page type sampling failed: {e}")
+
+        return {'text_pages': list(range(1, total)), 'figure_pages': []}
+
+    def _infer_page_boundaries(self, sample_results: List[Dict],
+                               sampled_indices: List[int], total_pages: int) -> Dict[str, List[int]]:
+        """Infer text/figure page boundary from sample classification results.
+
+        Patents typically have text first, then figures at the end.
+        Find the transition point from the samples.
+        """
+        type_map = {}
+        for entry in sample_results:
+            page_num = entry.get('page', 0) - 1
+            page_type = entry.get('type', 'text')
+            type_map[page_num] = page_type
+
+        last_text_sample = 0
+        first_figure_sample = total_pages
+        for idx in sorted(sampled_indices):
+            if type_map.get(idx, 'text') == 'text':
+                last_text_sample = idx
+            else:
+                first_figure_sample = min(first_figure_sample, idx)
+
+        if first_figure_sample <= last_text_sample:
+            boundary = (last_text_sample + first_figure_sample) // 2
+        else:
+            boundary = first_figure_sample
+
+        text_pages = list(range(1, boundary))
+        figure_pages = list(range(boundary, total_pages))
+
+        logger.info(f"  Inferred boundary: pages 1-{boundary} = text, "
+                   f"pages {boundary+1}-{total_pages} = figures")
+        return {'text_pages': text_pages, 'figure_pages': figure_pages}
+
+    def _classify_pages_heuristic(self, pdf_path: Path, page_data: List[Dict]) -> Dict[str, List[int]]:
+        """Classify pages as text vs figure using local Tesseract (no API calls).
+
+        Samples evenly-spaced pages, runs quick Tesseract OCR at 150 DPI,
+        and classifies based on word count and line density (not just word count,
+        since chemical structure pages also contain labels/formulas).
+        """
+        import pytesseract
+
+        total = len(page_data)
+        n_samples = min(10, max(5, total // 40))
+        step = total // (n_samples + 1)
+        sample_indices = [step * (i + 1) for i in range(n_samples)]
+        sample_indices = [i for i in sample_indices if 0 < i < total]
+
+        logger.info(f"  Heuristic classification: sampling {len(sample_indices)} pages at 150 DPI...")
+        images = self.render_pages_to_images(pdf_path, sample_indices, dpi=150)
+
+        sample_results = []
+        for idx in sample_indices:
+            if idx not in images:
+                continue
+            try:
+                text = pytesseract.image_to_string(images[idx], config='--psm 6 --oem 1')
+                page_type = self._classify_page_from_ocr_text(text)
+                sample_results.append({'page': idx + 1, 'type': page_type})
+            except Exception:
+                sample_results.append({'page': idx + 1, 'type': 'text'})
+            del images[idx]
+
+        if not sample_results:
+            return {'text_pages': list(range(1, total)), 'figure_pages': []}
+
+        return self._infer_page_boundaries(sample_results, sample_indices, total)
+
+    def _classify_page_from_ocr_text(self, text: str) -> str:
+        """Classify a single page as text or figure based on OCR output characteristics.
+
+        Text pages have dense paragraphs (many words, long lines, high line count).
+        Figure pages have sparse labels, short lines, and low word count.
+        Chemical structure pages fall in between — they have some words (labels,
+        compound names) but lack the paragraph density of text pages.
+        """
+        lines = [l for l in text.strip().split('\n') if l.strip()]
+        words = text.split()
+        word_count = len(words)
+        line_count = len(lines)
+
+        if word_count < 15:
+            return 'figure'
+
+        # Average words per line — text pages have ~8-15 words/line (paragraphs),
+        # figure pages have ~2-4 words/line (labels, short captions)
+        avg_words_per_line = word_count / max(1, line_count)
+
+        # Long lines (>40 chars) indicate paragraph text
+        long_lines = sum(1 for l in lines if len(l.strip()) > 40)
+        long_line_ratio = long_lines / max(1, line_count)
+
+        if word_count > 100 and avg_words_per_line > 5 and long_line_ratio > 0.3:
+            return 'text'
+
+        if word_count < 50 or avg_words_per_line < 3:
+            return 'figure'
+
+        # Ambiguous — lean toward text (safer: Tesseract OCR handles it fine,
+        # and figure analysis can still process these pages later)
+        return 'text'
+
+    def _ocr_text_pages_tesseract(self, pdf_path: Path, page_data: List[Dict],
+                                   text_page_indices: List[int]) -> int:
+        """OCR text pages from scanned PDF using local Tesseract (free, fast).
+
+        Renders pages in batches at 200 DPI via PyMuPDF, runs pytesseract per page.
+        Processes all pages — no budget constraint since it's free.
+        """
+        import pytesseract
+
+        logger.info(f"  Tesseract OCR: processing {len(text_page_indices)} pages "
+                   f"(batch size {self.TESSERACT_BATCH_SIZE}, {self.TESSERACT_DPI} DPI)...")
+
+        ocr_count = 0
+        total_batches = -(-len(text_page_indices) // self.TESSERACT_BATCH_SIZE)
+
+        for batch_num, batch_start in enumerate(range(0, len(text_page_indices), self.TESSERACT_BATCH_SIZE)):
+            batch_indices = text_page_indices[batch_start:batch_start + self.TESSERACT_BATCH_SIZE]
+            images = self.render_pages_to_images(pdf_path, batch_indices, dpi=self.TESSERACT_DPI)
+
+            for page_num in batch_indices:
+                if page_num not in images:
+                    continue
+                try:
+                    text = pytesseract.image_to_string(
+                        images[page_num], config=self.TESSERACT_CONFIG)
+                    text = self.clean_patent_text(text)
+                    if text and len(text.strip()) > self.TESSERACT_MIN_CHARS:
+                        page_data[page_num]['text'] = text
+                        page_data[page_num]['text_length'] = len(text)
+                        page_data[page_num]['classification'] = 'TEXT_HEAVY'
+                        page_data[page_num]['ocr_method'] = 'tesseract'
+                        ocr_count += 1
+                except Exception as e:
+                    logger.debug(f"  Tesseract failed on page {page_num + 1}: {e}")
+                del images[page_num]
+
+            if (batch_num + 1) % 5 == 0 or batch_num == total_batches - 1:
+                logger.info(f"  Tesseract progress: batch {batch_num + 1}/{total_batches}, "
+                           f"{ocr_count} pages extracted")
+
+        logger.info(f"  Tesseract OCR complete: {ocr_count}/{len(text_page_indices)} pages recovered")
+        return ocr_count
+
+    def _find_claims_pages(self, page_data: List[Dict]) -> List[int]:
+        """Identify which pages contain the claims section from OCR'd text."""
+        claims_pattern = re.compile(self.PATENT_SECTION_PATTERNS['claims'])
+        claim_number_pattern = re.compile(r'^\s*(\d+)\.\s+(?:A|An|The|Wherein|Said)\s', re.MULTILINE)
+
+        claims_pages = []
+        for i, page in enumerate(page_data):
+            if page['classification'] != 'TEXT_HEAVY' or not page.get('text'):
+                continue
+            text = page['text'][:2000]
+            if claims_pattern.search(text) or len(claim_number_pattern.findall(text)) >= 3:
+                claims_pages.append(i)
+
+        return claims_pages
+
+    def _ocr_text_pages(self, pdf_path: Path, page_data: List[Dict],
+                        text_page_indices: List[int]) -> int:
+        """OCR text pages from image-only PDF using Vision AI.
+
+        Reuses the enhance_text_pages_vision pattern but without garbled-text RAG context.
+        """
+        max_ocr = min(len(text_page_indices), self.MAX_VISION_TEXT_PAGES * 3)
+        if len(text_page_indices) > max_ocr:
+            logger.info(f"  Capping OCR from {len(text_page_indices)} to {max_ocr} pages")
+            text_page_indices = text_page_indices[:max_ocr]
+
+        budget_for_ocr = self._budget_remaining() - 20
+        max_by_budget = budget_for_ocr * self.PAGES_PER_VISION_TEXT_BATCH
+        if max_by_budget < len(text_page_indices):
+            logger.info(f"  Budget limits OCR to {max_by_budget} pages")
+            text_page_indices = text_page_indices[:max(10, max_by_budget)]
+
+        logger.info(f"  OCR: extracting text from {len(text_page_indices)} pages via Vision AI...")
+
+        client = self.get_anthropic_client()
+        if not client:
+            return 0
+
+        batches = []
+        for i in range(0, len(text_page_indices), self.PAGES_PER_VISION_TEXT_BATCH):
+            batch_indices = text_page_indices[i:i + self.PAGES_PER_VISION_TEXT_BATCH]
+            batches.append(batch_indices)
+
+        ocr_count = 0
+        with ThreadPoolExecutor(max_workers=self.MAX_CONCURRENT_BATCHES) as executor:
+            futures = {}
+            for batch_idx, batch_indices in enumerate(batches):
+                future = executor.submit(self._ocr_batch, pdf_path, batch_indices, batch_idx)
+                futures[future] = batch_idx
+
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                try:
+                    result = future.result()
+                    for page_num, text in result.items():
+                        if text and len(text.strip()) > 50:
+                            page_data[page_num]['text'] = text
+                            page_data[page_num]['text_length'] = len(text)
+                            page_data[page_num]['classification'] = 'TEXT_HEAVY'
+                            page_data[page_num]['ocr_extracted'] = True
+                            ocr_count += 1
+                    if result:
+                        logger.info(f"  OCR batch {batch_idx+1}/{len(batches)}: "
+                                   f"{len(result)} pages extracted")
+                except Exception as e:
+                    logger.error(f"  OCR batch {batch_idx+1} failed: {e}")
+
+        logger.info(f"  OCR complete: {ocr_count}/{len(text_page_indices)} pages recovered text")
+        return ocr_count
+
+    def _ocr_batch(self, pdf_path: Path, page_indices: List[int], batch_idx: int) -> Dict[int, str]:
+        """OCR a batch of pages using Vision AI (no garbled-text context)."""
+        if not self._track_api_call():
+            return {}
+
+        client = self.get_anthropic_client()
+        if not client:
+            return {}
+
+        images = self.render_pages_to_images(pdf_path, page_indices,
+                                             dpi=self.VISION_DPI_TEXT_ENHANCEMENT)
+        content = []
+        valid_pages = []
+        for page_num in page_indices:
+            if page_num not in images:
+                continue
+            img_base64, media_type = self.encode_image_to_base64(
+                images[page_num], max_dimension=self.MAX_IMAGE_DIMENSION_TEXT)
+            del images[page_num]
+            if not img_base64:
+                continue
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": img_base64}
+            })
+            valid_pages.append(page_num)
+
+        if not content:
+            return {}
+
+        pages_str = ', '.join(str(p + 1) for p in valid_pages)
+        prompt = f"""Extract ALL text verbatim from these patent document pages (pages {pages_str}).
+
+These are scanned/image-based patent pages. Rules:
+1. Extract ALL visible text exactly as printed — every word, paragraph number, claim number
+2. Preserve paragraph structure, section headers ([0001], [0002]...), numbered claims, and lists
+3. Preserve ALL scientific terminology, chemical names, compound numbers, formulas exactly as written
+4. If a page contains chemical structure DIAGRAMS (graphical molecular drawings), write ONLY: [CHEMICAL STRUCTURE: brief description]
+5. Do NOT add ANY commentary, questions, summaries, or text not visible on the page
+6. Do NOT say "Would you like..." or "I can help..." — output ONLY the extracted text
+7. Extract the COMPLETE text — do not truncate, summarize, or skip any content
+
+Output the text for each page, separated by:
+===PAGE N===
+(where N is the page number)
+
+Start with ===PAGE {valid_pages[0] + 1}==="""
+
+        content.append({"type": "text", "text": prompt})
+
+        try:
+            response = client.messages.create(
+                model=self.VISION_MODEL,
+                max_tokens=4096 * len(valid_pages),
+                messages=[{"role": "user", "content": content}]
+            )
+            return self._parse_enhanced_text_response(response.content[0].text, valid_pages)
+        except Exception as e:
+            logger.error(f"  OCR batch {batch_idx} API call failed: {e}")
+            return {}
+
     # ─── Stage 1: Bibliographic Data Extraction ────────────────────────────
 
     def extract_bibliographic_data(self, cover_text: str, pdf_path: Path) -> Dict:
@@ -685,23 +1146,27 @@ Start with ===PAGE {page_numbers[0] + 1}==="""
         bib = {}
 
         # Patent number from filename (most reliable)
+        # Handles: wo2023037268, wo-2023037268-a1, WO-2023-037268-A1, wo25045758
         stem = pdf_path.stem.lower()
-        wo_file_match = re.match(r'wo(\d{6,})', stem)
-        ep_file_match = re.match(r'ep(\d{6,})', stem)
-        us_file_match = re.match(r'us(\d{6,})', stem)
+        wo_file_match = re.match(r'wo[-_]?(\d{4})[-_]?(\d{3,})(?:[-_]([a-z]\d?))?$', stem)
+        ep_file_match = re.match(r'ep[-_]?(\d{6,})(?:[-_]([a-z]\d?))?$', stem)
+        us_file_match = re.match(r'us[-_]?(\d{6,})(?:[-_]([a-z]\d?))?$', stem)
 
         if wo_file_match:
-            num = wo_file_match.group(1)
-            bib['patent_number'] = f"WO{num}A1"
-            bib['patent_number_formatted'] = f"WO {num[:4]}/{num[4:]} A1"
+            num = wo_file_match.group(1) + wo_file_match.group(2)
+            kind = (wo_file_match.group(3) or 'a1').upper()
+            bib['patent_number'] = f"WO{num}{kind}"
+            bib['patent_number_formatted'] = f"WO {num[:4]}/{num[4:]} {kind}"
         elif ep_file_match:
             num = ep_file_match.group(1)
-            bib['patent_number'] = f"EP{num}"
-            bib['patent_number_formatted'] = f"EP {num}"
+            kind = (ep_file_match.group(2) or '').upper()
+            bib['patent_number'] = f"EP{num}{kind}"
+            bib['patent_number_formatted'] = f"EP {num} {kind}".strip()
         elif us_file_match:
             num = us_file_match.group(1)
-            bib['patent_number'] = f"US{num}"
-            bib['patent_number_formatted'] = f"US {num}"
+            kind = (us_file_match.group(2) or '').upper()
+            bib['patent_number'] = f"US{num}{kind}"
+            bib['patent_number_formatted'] = f"US {num} {kind}".strip()
         else:
             # Fallback: try cover text
             pub_match = re.search(r'WO\s*(\d{4})[/]?(\d+)\s*([A-Z]\d?)?', cover_text)
@@ -739,6 +1204,8 @@ Start with ===PAGE {page_numbers[0] + 1}==="""
         logger.info("  Using Vision AI for cover page (applicants, inventors, title)...")
         client = self.get_anthropic_client()
         if not client:
+            return {}
+        if not self._track_api_call():
             return {}
 
         images = self.render_pages_to_images(pdf_path, [0])
@@ -802,7 +1269,19 @@ Important:
 
         for section_name, pattern in self.PATENT_SECTION_PATTERNS.items():
             matches = list(re.finditer(pattern, full_text))
-            if matches:
+            if not matches:
+                continue
+            # For claims: use the match that's followed by numbered claims (1. A compound...)
+            # to avoid matching "Claims" in search reports or cross-references
+            if section_name == 'claims':
+                best = self._find_real_claims_header(matches, full_text)
+                if best:
+                    section_positions.append({
+                        'name': section_name,
+                        'start': best.start(),
+                        'header_end': best.end()
+                    })
+            else:
                 section_positions.append({
                     'name': section_name,
                     'start': matches[0].start(),
@@ -821,6 +1300,36 @@ Important:
         found = list(sections.keys())
         logger.info(f"  Sections identified: {found}")
         return sections
+
+    def _find_real_claims_header(self, matches: list, full_text: str):
+        """Find the claims header that's followed by actual numbered claims.
+
+        Patents have "Claims" mentioned in search reports, cross-references, and
+        table of contents. The real claims section is followed by "1. A/An..." pattern.
+        """
+        claim_start_pattern = re.compile(
+            r'\n\s*1\.\s+(?:A|An|The|What)\s', re.IGNORECASE)
+
+        for match in matches:
+            # Look at the 500 chars after this "Claims" header
+            after = full_text[match.end():match.end() + 500]
+            if claim_start_pattern.search(after):
+                return match
+
+        # Fallback: if no match has numbered claims after it, look for standalone
+        # "Claims" or "CLAIMS" on its own line (likely a section header)
+        standalone = re.compile(r'^\s*(?:Claims|CLAIMS)\s*$', re.MULTILINE)
+        for match in matches:
+            line_start = full_text.rfind('\n', 0, match.start()) + 1
+            line_end = full_text.find('\n', match.end())
+            if line_end == -1:
+                line_end = len(full_text)
+            line = full_text[line_start:line_end].strip()
+            if standalone.match(line):
+                return match
+
+        # Last resort: use the last match (claims are typically near the end)
+        return matches[-1] if matches else None
 
     # ─── Stage 3: Claims Parsing ──────────────────────────────────────────
 
@@ -872,18 +1381,14 @@ Important:
 
     def _classify_claim(self, claim_text: str) -> str:
         first_100 = claim_text[:100].lower()
-        if re.match(r'(?:a|an)\s+(compound|composition|conjugate|antibody|polypeptide|nucleic acid|vector|cell|adc)', first_100):
+        if re.match(r'(?:a|an|the)\s+(?:compound|composition|conjugate|antibody|polypeptide|nucleic acid|vector|cell|adc)\b', first_100):
             return 'composition'
-        elif re.match(r'(?:a|an)\s+(method|process)\s', first_100):
+        elif re.match(r'(?:a|an|the)\s+(?:method|process)\s', first_100):
             return 'method'
-        elif re.match(r'(use\s+of|.*for\s+use\s+)', first_100):
+        elif re.match(r'(?:use\s+of\b|.{0,30}\bfor\s+use\s+)', first_100):
             return 'use'
-        elif re.match(r'(?:a|an)\s+pharmaceutical', first_100):
+        elif re.match(r'(?:a|an|the)\s+pharmaceutical', first_100):
             return 'pharmaceutical'
-        elif re.match(r'(?:the|an?)\s+(?:compound|composition|conjugate|antibody|adc)', first_100):
-            return 'composition'
-        elif re.match(r'(?:the|an?)\s+(?:method|process)', first_100):
-            return 'method'
         return 'other'
 
     def _build_claim_tree(self, claims: List[Dict]) -> Dict:
@@ -925,9 +1430,11 @@ Important:
                             max_pages: Optional[int] = None) -> List[Dict]:
         figure_pages = [p for p in page_data if p['classification'] == 'FIGURE_PAGE']
 
-        if max_pages and len(figure_pages) > max_pages:
-            logger.info(f"  Limiting from {len(figure_pages)} to {max_pages} figure pages")
-            figure_pages = figure_pages[:max_pages]
+        effective_max = max_pages if max_pages is not None else self.DEFAULT_MAX_FIGURE_PAGES
+        if effective_max > 0 and len(figure_pages) > effective_max:
+            logger.warning(f"  {len(figure_pages)} figure pages exceed cap of {effective_max} — "
+                          f"truncating (use --max-figure-pages 0 for unlimited)")
+            figure_pages = figure_pages[:effective_max]
 
         if not figure_pages:
             logger.info("  No figure pages to analyze")
@@ -987,6 +1494,8 @@ Important:
     def _analyze_figure_batch(self, pdf_path: Path, batch: List[Dict], batch_idx: int,
                              compound_names: List[str], drawings_text: str,
                              figure_page_indices: List[int] = None) -> List[Dict]:
+        if not self._track_api_call():
+            return []
         client = self.get_anthropic_client()
         if not client:
             return []
@@ -1038,10 +1547,18 @@ Important:
         if drawings_text:
             fig_nums_to_search = set()
             if figure_page_indices:
-                for idx in figure_page_indices:
-                    fig_start = max(1, idx * 2)
-                    for fn in range(fig_start, fig_start + 4):
-                        fig_nums_to_search.add(fn)
+                # Figure numbers are sequential (1, 2, 3...) across all figure pages.
+                # Estimate which figures are on these pages by their position in the
+                # figure page sequence.
+                n_fig_pages = len(figure_page_indices)
+                for batch_pos, idx in enumerate(figure_page_indices):
+                    # Estimate ~1-2 figures per page on average
+                    fig_start = max(1, batch_pos + 1)
+                    fig_nums_to_search.add(fig_start)
+                    fig_nums_to_search.add(fig_start + 1)
+                # Also always search for the first 10 figures (most important)
+                for i in range(1, min(11, n_fig_pages + 5)):
+                    fig_nums_to_search.add(i)
             else:
                 for i in range(1, 60):
                     fig_nums_to_search.add(i)
@@ -1085,6 +1602,8 @@ Return ONLY a valid JSON array. No other text."""
         logger.info("Stage 5: Extracting key compound and biological data...")
         client = self.get_anthropic_client()
         if not client:
+            return {}
+        if not self._track_api_call():
             return {}
 
         # Get synthesis data from examples section
@@ -1173,21 +1692,26 @@ Max 10 compounds, max 10 biological results. Return ONLY valid JSON."""
 
     def refine_chemical_structures(self, pdf_path: Path, figures: List[Dict],
                                     sections: Dict[str, str]) -> List[Dict]:
-        """Re-extract SMILES for chemical structures with low/medium confidence.
+        """Re-extract SMILES for chemical structures with medium/null confidence.
 
-        Uses higher DPI + RAG context (figure descriptions, patent text, scaffold info)
-        for a focused SMILES-only extraction pass.
+        Batched by page and parallelized. Skips structures already at 'low' confidence
+        (refinement rarely upgrades these). Capped at MAX_SMILES_REFINEMENT structures.
         """
         chem_figs = [f for f in figures
                      if f.get('type') == 'chemical_structure'
-                     and f.get('smiles_confidence') in ('low', 'medium', None)
+                     and f.get('smiles_confidence') in ('medium', None)
                      and f.get('page')]
 
         if not chem_figs:
             logger.info("Stage 5.5: No chemical structures need SMILES refinement")
             return figures
 
-        logger.info(f"Stage 5.5: Refining SMILES for {len(chem_figs)} chemical structures...")
+        if len(chem_figs) > self.MAX_SMILES_REFINEMENT:
+            logger.info(f"Stage 5.5: Capping SMILES refinement from {len(chem_figs)} "
+                       f"to {self.MAX_SMILES_REFINEMENT} structures")
+            chem_figs = chem_figs[:self.MAX_SMILES_REFINEMENT]
+
+        logger.info(f"Stage 5.5: Refining SMILES for {len(chem_figs)} structures (batched by page)...")
 
         client = self.get_anthropic_client()
         if not client:
@@ -1200,85 +1724,38 @@ Max 10 compounds, max 10 biological results. Return ONLY valid JSON."""
         if scaffold_match:
             scaffold_context = f"\nCore scaffold from claims: {scaffold_match.group(0)[:500]}\n"
 
-        pages_needed = sorted(set(f['page'] - 1 for f in chem_figs))
+        # Group structures by page for batched API calls
+        from collections import defaultdict
+        page_groups = defaultdict(list)
+        for fig in chem_figs:
+            page_groups[fig['page'] - 1].append(fig)
+
+        pages_needed = sorted(page_groups.keys())
         images = self.render_pages_to_images(pdf_path, pages_needed,
                                               dpi=self.CHEMICAL_STRUCTURE_DPI)
 
+        logger.info(f"  {len(chem_figs)} structures across {len(page_groups)} pages "
+                   f"→ {len(page_groups)} API calls (was {len(chem_figs)} sequential)")
+
         refined_count = 0
-        for fig in chem_figs:
-            page_0 = fig['page'] - 1
-            if page_0 not in images:
-                continue
-
-            img_base64, media_type = self.encode_image_to_base64(
-                images[page_0], max_dimension=self.MAX_IMAGE_DIMENSION_CHEMICAL)
-            if not img_base64:
-                continue
-
-            label = fig.get('label', 'Unknown')
-            description = fig.get('description', '')[:500]
-
-            legend = ""
-            fig_match = re.search(rf'FIG[S.]?\s*{re.escape(str(fig["page"]))}\b[^\n]*',
-                                  drawings_text, re.IGNORECASE)
-            if fig_match:
-                legend = f"\nFigure legend: {fig_match.group(0).strip()[:300]}\n"
-
-            compound_mention = ""
-            compound_id = re.search(r'(\d{3,4})', label)
-            if compound_id:
-                for section_name, section_text in sections.items():
-                    idx = section_text.find(compound_id.group(1))
-                    if idx >= 0:
-                        start = max(0, idx - 200)
-                        end = min(len(section_text), idx + 300)
-                        compound_mention = f"\nPatent text about this compound: ...{section_text[start:end]}...\n"
-                        break
-
-            prompt = f"""Focus on the chemical structure labeled "{label}" on page {fig['page']}.
-
-Previous description: {description}
-{scaffold_context}{legend}{compound_mention}
-Provide ONLY a JSON object with:
-- "smiles": Canonical SMILES notation. Include stereochemistry (@, @@) where visible. For complex structures, provide the FULL structure, not just the core scaffold.
-- "smiles_confidence": "high" if simple/clear structure, "medium" if moderate complexity, "low" if uncertain
-- "inchi": InChI string if possible, null otherwise
-- "molecular_formula": e.g. "C23H28BrN7O" if determinable
-- "molecular_weight": approximate MW if formula is known, null otherwise
-
-Return ONLY valid JSON. No other text."""
-
-            content = [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_base64}},
-                {"type": "text", "text": prompt}
-            ]
-
-            try:
-                response = client.messages.create(
-                    model=self.VISION_MODEL,
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": content}]
+        with ThreadPoolExecutor(max_workers=self.MAX_CONCURRENT_BATCHES) as executor:
+            futures = {}
+            for page_0, figs_on_page in page_groups.items():
+                if page_0 not in images:
+                    continue
+                future = executor.submit(
+                    self._refine_smiles_batch, images[page_0], page_0,
+                    figs_on_page, scaffold_context, drawings_text, sections
                 )
-                result = self.parse_json_response(response.content[0].text)
-                if result and result.get('smiles'):
-                    new_smiles = result['smiles']
-                    if self.validate_smiles(new_smiles):
-                        old_conf = fig.get('smiles_confidence', 'none')
-                        new_conf = result.get('smiles_confidence', 'medium')
-                        fig['smiles'] = new_smiles
-                        fig['smiles_confidence'] = new_conf
-                        if result.get('inchi'):
-                            fig['inchi'] = result['inchi']
-                        if result.get('molecular_formula'):
-                            fig['molecular_formula'] = result['molecular_formula']
-                        if result.get('molecular_weight'):
-                            fig['molecular_weight'] = result['molecular_weight']
-                        refined_count += 1
-                        logger.info(f"    {label}: SMILES refined ({old_conf} -> {new_conf})")
-                    else:
-                        logger.warning(f"    {label}: Refined SMILES failed validation")
-            except Exception as e:
-                logger.error(f"    {label}: SMILES refinement failed: {e}")
+                futures[future] = page_0
+
+            for future in as_completed(futures):
+                page_0 = futures[future]
+                try:
+                    count = future.result()
+                    refined_count += count
+                except Exception as e:
+                    logger.error(f"  SMILES batch for page {page_0+1} failed: {e}")
 
         for page_num in list(images.keys()):
             del images[page_num]
@@ -1291,12 +1768,108 @@ Return ONLY valid JSON. No other text."""
 
         return figures
 
+    def _refine_smiles_batch(self, page_image, page_0: int, figs_on_page: List[Dict],
+                             scaffold_context: str, drawings_text: str,
+                             sections: Dict[str, str]) -> int:
+        """Refine SMILES for all structures on a single page in one API call."""
+        if not self._track_api_call():
+            return 0
+
+        client = self.get_anthropic_client()
+        if not client:
+            return 0
+
+        img_base64, media_type = self.encode_image_to_base64(
+            page_image, max_dimension=self.MAX_IMAGE_DIMENSION_CHEMICAL)
+        if not img_base64:
+            return 0
+
+        # Build context for all structures on this page
+        structures_desc = []
+        for fig in figs_on_page:
+            label = fig.get('label', 'Unknown')
+            description = fig.get('description', '')[:200]
+            structures_desc.append(f'- "{label}": {description}')
+        structures_list = '\n'.join(structures_desc)
+
+        legend = ""
+        fig_match = re.search(rf'FIG[S.]?\s*{page_0 + 1}\b[^\n]*',
+                              drawings_text, re.IGNORECASE)
+        if fig_match:
+            legend = f"\nFigure legend: {fig_match.group(0).strip()[:300]}\n"
+
+        prompt = f"""Analyze the chemical structures on page {page_0 + 1}.
+
+Structures to identify:
+{structures_list}
+{scaffold_context}{legend}
+For EACH structure listed above, provide a JSON array with one object per structure:
+[{{
+  "label": "structure label exactly as listed above",
+  "smiles": "Canonical SMILES with stereochemistry where visible",
+  "smiles_confidence": "high"|"medium"|"low",
+  "molecular_formula": "e.g. C23H28BrN7O or null",
+  "molecular_weight": "approximate MW or null"
+}}]
+
+Return ONLY the JSON array. No other text."""
+
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_base64}},
+            {"type": "text", "text": prompt}
+        ]
+
+        try:
+            response = client.messages.create(
+                model=self.VISION_MODEL,
+                max_tokens=1024 * max(1, len(figs_on_page)),
+                messages=[{"role": "user", "content": content}]
+            )
+            results = self.parse_json_response(response.content[0].text)
+            if not isinstance(results, list):
+                results = [results] if results else []
+
+            refined = 0
+            results_by_label = {r.get('label', ''): r for r in results if r}
+
+            for fig in figs_on_page:
+                label = fig.get('label', 'Unknown')
+                result = results_by_label.get(label)
+                if not result:
+                    for r in results:
+                        if r and label.lower() in r.get('label', '').lower():
+                            result = r
+                            break
+                if not result or not result.get('smiles'):
+                    continue
+                new_smiles = result['smiles']
+                if self.validate_smiles(new_smiles):
+                    old_conf = fig.get('smiles_confidence', 'none')
+                    new_conf = result.get('smiles_confidence', 'medium')
+                    fig['smiles'] = new_smiles
+                    fig['smiles_confidence'] = new_conf
+                    if result.get('molecular_formula'):
+                        fig['molecular_formula'] = result['molecular_formula']
+                    if result.get('molecular_weight'):
+                        fig['molecular_weight'] = result['molecular_weight']
+                    refined += 1
+                    logger.info(f"    {label}: SMILES refined ({old_conf} -> {new_conf})")
+                else:
+                    logger.warning(f"    {label}: Refined SMILES failed validation")
+
+            return refined
+        except Exception as e:
+            logger.error(f"  SMILES batch page {page_0+1} failed: {e}")
+            return 0
+
     # ─── Stage 6: Executive Summary & Protection Scope ─────────────────────
 
     def generate_summaries(self, sections: Dict[str, str], claims_data: Dict, bib: Dict) -> Dict[str, str]:
         logger.info("Stage 6: Generating executive summary and protection scope...")
         client = self.get_anthropic_client()
         if not client:
+            return {}
+        if not self._track_api_call():
             return {}
 
         summary_text = sections.get('summary', '')[:3000]
@@ -1467,7 +2040,10 @@ Format your response EXACTLY as:
                          figures: List[Dict], key_data: Dict, summaries: Dict,
                          quality_scores: Dict, full_text_length: int,
                          total_pages: int, figure_pages_analyzed: int,
-                         text_enhanced_count: int = 0, reclassified_count: int = 0) -> str:
+                         text_enhanced_count: int = 0, reclassified_count: int = 0,
+                         is_scanned_pdf: bool = False, ocr_page_count: int = 0,
+                         total_api_calls: int = 0,
+                         ocr_engine_used: Optional[str] = None) -> str:
         md = []
 
         # YAML frontmatter
@@ -1503,15 +2079,30 @@ Format your response EXACTLY as:
         md.append(f"total_pages: {total_pages}\n")
         md.append(f"total_claims: {claims_data.get('total_claims', 0)}\n")
         md.append(f"independent_claims: {len(claims_data.get('independent_claims', []))}\n")
-        method = "native_vision_enhanced" if text_enhanced_count > 0 else "native_vision_selective"
+        if is_scanned_pdf:
+            if ocr_engine_used and 'tesseract' in ocr_engine_used:
+                method = "tesseract_hybrid" if ocr_engine_used == 'tesseract_hybrid' else "tesseract_ocr"
+            else:
+                method = "vision_ocr"
+        elif text_enhanced_count > 0:
+            method = "native_vision_enhanced"
+        else:
+            method = "native_vision_selective"
         md.append(f"extraction_method: {method}\n")
+        md.append(f"is_scanned_pdf: {str(is_scanned_pdf).lower()}\n")
+        if ocr_engine_used:
+            md.append(f"ocr_engine: {ocr_engine_used}\n")
         md.append(f"vision_model: {self.VISION_MODEL}\n")
         md.append(f"processing_date: {datetime.now().strftime('%Y-%m-%d')}\n")
         md.append(f"figure_pages_analyzed: {figure_pages_analyzed}\n")
+        if ocr_page_count > 0:
+            md.append(f"ocr_pages_recovered: {ocr_page_count}\n")
         if text_enhanced_count > 0:
             md.append(f"text_pages_enhanced: {text_enhanced_count}\n")
         if reclassified_count > 0:
             md.append(f"figure_pages_reclassified: {reclassified_count}\n")
+        if total_api_calls > 0:
+            md.append(f"total_api_calls: {total_api_calls}\n")
         md.append(f"quality_overall: {quality_scores['overall']}/10\n")
         md.append(f"quality_assessment: {quality_scores['assessment']}\n")
         # Semantic classification fields from Stage 6
@@ -1623,22 +2214,23 @@ Format your response EXACTLY as:
             md.append("| ID | Label | SMILES | Confidence | Formula | MW | Page |\n")
             md.append("|----|-------|--------|------------|---------|----:|------|\n")
             for fig in chem_figures[:20]:
-                label = fig.get('label', 'Structure')
-                smiles = fig.get('smiles', '-') if str(fig.get('smiles', '')).lower() not in ('null', 'none', '') else '-'
-                conf = fig.get('smiles_confidence', '-') or '-'
-                formula = fig.get('molecular_formula', '-') or '-'
-                mw = fig.get('molecular_weight', '-') or '-'
+                label = str(fig.get('label', 'Structure') or 'Structure')
+                smiles_raw = fig.get('smiles', '')
+                smiles = str(smiles_raw) if str(smiles_raw or '').lower() not in ('null', 'none', '', '[]') else '-'
+                conf = str(fig.get('smiles_confidence', '-') or '-')
+                formula = str(fig.get('molecular_formula', '-') or '-')
+                mw = str(fig.get('molecular_weight', '-') or '-')
                 page = fig.get('page', '-')
                 md.append(f"| {label} | {label} | `{smiles}` | {conf} | {formula} | {mw} | {page} |\n")
             md.append("\n")
             # Detailed descriptions below the table
             for fig in chem_figures[:20]:
-                label = fig.get('label', 'Structure')
+                label = str(fig.get('label', 'Structure') or 'Structure')
                 md.append(f"### {label}\n")
                 if fig.get('description'):
-                    md.append(f"**Description**: {fig['description']}\n\n")
-                if fig.get('smiles') and str(fig['smiles']).lower() not in ('null', 'none', ''):
-                    confidence = fig.get('smiles_confidence', 'unknown')
+                    md.append(f"**Description**: {str(fig['description'])}\n\n")
+                if fig.get('smiles') and str(fig['smiles']).lower() not in ('null', 'none', '', '[]'):
+                    confidence = str(fig.get('smiles_confidence', 'unknown') or 'unknown')
                     md.append(f"**SMILES** (confidence: {confidence}): `{fig['smiles']}`\n\n")
                 if fig.get('inchi'):
                     md.append(f"**InChI**: `{fig['inchi']}`\n\n")
@@ -1648,7 +2240,7 @@ Format your response EXACTLY as:
                         md.append(f" | **MW**: {fig['molecular_weight']}")
                     md.append("\n\n")
                 if fig.get('key_findings'):
-                    md.append(f"**Key Data**: {fig['key_findings']}\n\n")
+                    md.append(f"**Key Data**: {str(fig['key_findings'])}\n\n")
                 md.append(f"*Page {fig.get('page', 'N/A')}*\n\n")
             md.append("---\n\n")
 
@@ -1672,11 +2264,13 @@ Format your response EXACTLY as:
             md.append("| Assay Type | Compounds | Cell Lines/Models | Key Result | Comparison |\n")
             md.append("|-----------|-----------|-------------------|------------|------------|\n")
             for res in key_data['biological_results'][:10]:
-                assay = res.get('assay_type', '-') or '-'
-                compounds = ', '.join(res.get('compounds_tested', ['-'])) if res.get('compounds_tested') else '-'
-                models = ', '.join(res.get('cell_lines_or_models', res.get('cell_lines', ['-']))) if res.get('cell_lines_or_models') or res.get('cell_lines') else '-'
-                key_result = (res.get('key_result', '-') or '-').replace('|', '/')
-                comparison = (res.get('comparison', '-') or '-').replace('|', '/')
+                assay = str(res.get('assay_type', '-') or '-')
+                compounds_val = res.get('compounds_tested', ['-'])
+                compounds = ', '.join(compounds_val) if isinstance(compounds_val, list) else str(compounds_val or '-')
+                models_val = res.get('cell_lines_or_models', res.get('cell_lines', ['-']))
+                models = ', '.join(models_val) if isinstance(models_val, list) else str(models_val or '-')
+                key_result = str(res.get('key_result', '-') or '-').replace('|', '/')
+                comparison = str(res.get('comparison', '-') or '-').replace('|', '/')
                 md.append(f"| {assay} | {compounds} | {models} | {key_result} | {comparison} |\n")
             md.append("\n---\n\n")
 
@@ -1685,21 +2279,21 @@ Format your response EXACTLY as:
         if non_chem_figures:
             md.append("## Figures & Drawings\n\n")
             for fig in non_chem_figures[:40]:
-                label = fig.get('label', 'Figure')
-                fig_type = fig.get('type', 'other')
+                label = str(fig.get('label', 'Figure') or 'Figure')
+                fig_type = str(fig.get('type', 'other') or 'other')
                 md.append(f"### {label}\n")
                 md.append(f"**Type**: {fig_type.replace('_', ' ').title()}\n\n")
                 if fig.get('title'):
-                    md.append(f"**Title**: {fig['title']}\n\n")
+                    md.append(f"**Title**: {str(fig['title'])}\n\n")
                 if fig.get('x_axis'):
                     md.append(f"**X-axis**: {fig['x_axis']} | **Y-axis**: {fig.get('y_axis', 'N/A')}\n\n")
                 if fig.get('data_series'):
                     series = fig['data_series'] if isinstance(fig['data_series'], list) else [fig['data_series']]
                     md.append(f"**Data Series**: {', '.join(str(s) for s in series)}\n\n")
                 if fig.get('key_findings'):
-                    md.append(f"**Key Findings**: {fig['key_findings']}\n\n")
+                    md.append(f"**Key Findings**: {str(fig['key_findings'])}\n\n")
                 elif fig.get('description'):
-                    md.append(f"**Description**: {fig['description']}\n\n")
+                    md.append(f"**Description**: {str(fig['description'])}\n\n")
                 md.append(f"*Page {fig.get('page', 'N/A')}*\n\n")
             md.append("---\n\n")
 
@@ -1709,11 +2303,11 @@ Format your response EXACTLY as:
             md.append("| Figure | Type | Page | Title | Key Finding |\n")
             md.append("|--------|------|-----:|-------|-------------|\n")
             for fig in figures[:50]:
-                label = fig.get('label', '-')
-                fig_type = fig.get('type', 'other').replace('_', ' ')
+                label = str(fig.get('label', '-') or '-')
+                fig_type = str(fig.get('type', 'other') or 'other').replace('_', ' ')
                 page = fig.get('page', '-')
-                title = (fig.get('title', '-') or '-').replace('|', '/')[:60]
-                finding = (fig.get('key_findings', '-') or '-').replace('|', '/').replace('\n', ' ')[:80]
+                title = str(fig.get('title', '-') or '-').replace('|', '/')[:60]
+                finding = str(fig.get('key_findings', '-') or '-').replace('|', '/').replace('\n', ' ')[:80]
                 md.append(f"| {label} | {fig_type} | {page} | {title} | {finding} |\n")
             md.append("\n---\n\n")
 
@@ -1736,15 +2330,21 @@ Format your response EXACTLY as:
         # Processing Metadata
         md.append("## Processing Metadata\n\n")
         md.append(f"- **Extraction Method**: {method}\n")
+        if is_scanned_pdf:
+            md.append(f"- **Document Type**: Scanned/image-only PDF (OCR applied)\n")
         md.append(f"- **Vision Model**: {self.VISION_MODEL}\n")
         md.append(f"- **Total Pages**: {total_pages}\n")
         md.append(f"- **Figure Pages Analyzed**: {figure_pages_analyzed}\n")
+        if ocr_page_count > 0:
+            md.append(f"- **OCR Pages Recovered**: {ocr_page_count}\n")
         if text_enhanced_count > 0:
             md.append(f"- **Text Pages Vision-Enhanced**: {text_enhanced_count}\n")
         if reclassified_count > 0:
             md.append(f"- **Text Pages Reclassified as Figure**: {reclassified_count}\n")
         md.append(f"- **Total Figures Described**: {len(figures)}\n")
         md.append(f"- **Text Length**: {full_text_length:,} characters\n")
+        if total_api_calls > 0:
+            md.append(f"- **Total API Calls**: {total_api_calls}\n")
         md.append(f"- **Processing Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         return "".join(md)
@@ -1757,6 +2357,8 @@ Format your response EXACTLY as:
         logger.info(f"\n{'='*70}")
         logger.info(f"PATENT PIPELINE: {pdf_path.name}")
         logger.info(f"{'='*70}")
+
+        self._api_call_count = 0
 
         # Stage 0: Characterize PDF
         pdf_info = self.characterize_pdf(pdf_path)
@@ -1777,9 +2379,69 @@ Format your response EXACTLY as:
 
         patent_id = bib.get('patent_number', pdf_path.stem)
 
-        if skip_existing and f"patent_{patent_id}" in self._existing_files:
+        if skip_existing and any(patent_id in f for f in self._existing_files):
             logger.info(f"Patent {patent_id} already processed - skipping")
             return True
+
+        # Stage 0.5: Detect image-only PDF and OCR text pages
+        is_scanned_pdf = self._detect_image_only_pdf(pdf_info)
+        ocr_page_count = 0
+        ocr_engine_used = None
+        if is_scanned_pdf and not no_vision:
+            logger.info("  DETECTED: Image-only/scanned PDF — initiating OCR workflow")
+
+            if self._tesseract_available and self._ocr_engine != 'vision':
+                # Tesseract path: free, local, processes ALL pages
+                logger.info("  Using Tesseract OCR (local, free) for bulk text extraction")
+                ocr_engine_used = 'tesseract'
+                page_type_map = self._classify_pages_heuristic(pdf_path, page_data)
+                text_page_indices = page_type_map.get('text_pages', [])
+                if text_page_indices:
+                    ocr_page_count = self._ocr_text_pages_tesseract(
+                        pdf_path, page_data, text_page_indices)
+                    # Check if claims were captured
+                    claims_pages = self._find_claims_pages(page_data)
+                    if claims_pages:
+                        logger.info(f"  Claims found on pages: "
+                                   f"{', '.join(str(p + 1) for p in claims_pages[:5])}")
+                    else:
+                        logger.info("  Claims not found in Tesseract output — "
+                                   "will attempt Vision AI on estimated claims region")
+                        # Try Vision AI on estimated claims pages (60-80% through text)
+                        if self._budget_remaining() > 10 and text_page_indices:
+                            start = int(len(text_page_indices) * 0.55)
+                            end = int(len(text_page_indices) * 0.85)
+                            claims_region = text_page_indices[start:end][:30]
+                            vision_ocr = self._ocr_text_pages(
+                                pdf_path, page_data, claims_region)
+                            ocr_page_count += vision_ocr
+                            ocr_engine_used = 'tesseract_hybrid'
+            else:
+                # Vision AI path: existing behavior (budget-limited)
+                logger.info("  Using Vision AI OCR (Tesseract unavailable)")
+                ocr_engine_used = 'vision'
+                page_type_map = self._sample_page_types_vision(pdf_path, page_data)
+                text_page_indices = page_type_map.get('text_pages', [])
+                if text_page_indices:
+                    ocr_page_count = self._ocr_text_pages(
+                        pdf_path, page_data, text_page_indices)
+
+            if ocr_page_count > 0:
+                # Reclassify remaining pages as figure pages
+                figure_page_indices = page_type_map.get('figure_pages', [])
+                for idx in figure_page_indices:
+                    if idx < len(page_data) and page_data[idx]['classification'] != 'TEXT_HEAVY':
+                        page_data[idx]['classification'] = 'FIGURE_PAGE'
+                # Update classifications dict
+                pdf_info['classifications'] = {}
+                for pd_item in page_data:
+                    cls = pd_item['classification']
+                    pdf_info['classifications'][cls] = pdf_info['classifications'].get(cls, 0) + 1
+                logger.info(f"  OCR complete: {ocr_page_count} text pages recovered "
+                           f"(engine: {ocr_engine_used})")
+                logger.info(f"  Updated classifications: {pdf_info['classifications']}")
+            else:
+                logger.info("  No text pages detected — treating as figures-only patent")
 
         # Stage 1.5: Text quality assessment and selective Vision AI re-extraction
         vision_enhanced_count = 0
@@ -1821,12 +2483,17 @@ Format your response EXACTLY as:
             quality_scores = self.calculate_quality_score(bib, claims_data, sections, [], {})
             markdown = self.generate_markdown(bib, sections, claims_data, [], {}, summaries,
                                             quality_scores, len(full_text), total_pages, 0)
-            output_path = self.output_dir / f"patent_{patent_id}.md"
+            out_stem = self._generate_output_filename(patent_id, bib)
+            output_path = self.output_dir / f"{out_stem}.md"
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(markdown)
+            self._existing_files.add(output_path.stem)
             logger.info(f"Saved claims-only output: {output_path}")
             self.log_quality(patent_id, quality_scores, saved=True, filename=pdf_path.name)
             return True
+
+        # Cost estimation before expensive stages
+        self._estimate_and_log_cost(page_data, no_vision)
 
         # Stage 4: Vision AI figure analysis
         figures = []
@@ -1868,10 +2535,14 @@ Format your response EXACTLY as:
             quality_scores=quality_scores, full_text_length=len(full_text),
             total_pages=total_pages, figure_pages_analyzed=figure_pages_analyzed,
             text_enhanced_count=vision_enhanced_count,
-            reclassified_count=reclassified_count
+            reclassified_count=reclassified_count,
+            is_scanned_pdf=is_scanned_pdf, ocr_page_count=ocr_page_count,
+            total_api_calls=self._api_call_count,
+            ocr_engine_used=ocr_engine_used
         )
 
-        output_path = self.output_dir / f"patent_{patent_id}.md"
+        out_stem = self._generate_output_filename(patent_id, bib)
+        output_path = self.output_dir / f"{out_stem}.md"
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(markdown)
         self._existing_files.add(output_path.stem)
@@ -1888,22 +2559,26 @@ Format your response EXACTLY as:
 
     def process_all_patents(self, input_path: Path, no_vision: bool = False,
                            max_figure_pages: Optional[int] = None,
-                           skip_existing: bool = False):
+                           skip_existing: bool = True):
         logger.info("="*70)
         logger.info("PATENT PROCESSING PIPELINE")
         logger.info("="*70)
         logger.info(f"Input: {input_path}")
         logger.info(f"Output: {self.output_dir}")
+        logger.info(f"Recursive: {self._recursive}")
+        logger.info(f"Naming: {self._naming}")
         logger.info(f"Vision AI: {'DISABLED' if no_vision else f'ENABLED ({self.VISION_MODEL})'}")
+        logger.info(f"Skip existing: {skip_existing}")
         logger.info("="*70)
 
         if not self.quality_log_path.exists() or self.quality_log_path.stat().st_size == 0:
             with open(self.quality_log_path, 'w', encoding='utf-8') as f:
                 f.write("TIMESTAMP\tPATENT_ID\tQUALITY_SCORE\tASSESSMENT\tSTATUS\tFILENAME\n")
 
-        pdf_files = list(input_path.glob("*.pdf"))
-        if not pdf_files:
+        if self._recursive:
             pdf_files = list(input_path.rglob("*.pdf"))
+        else:
+            pdf_files = list(input_path.glob("*.pdf"))
 
         if not pdf_files:
             logger.error("No PDF files found")
@@ -1952,13 +2627,26 @@ def main():
     parser.add_argument('--no-vision', action='store_true',
                        help='Skip Vision AI analysis (text-only extraction)')
     parser.add_argument('--max-figure-pages', type=int, default=None,
-                       help='Limit number of figure pages analyzed with Vision AI (default: all)')
+                       help='Limit figure pages for Vision AI (default: 50, 0=unlimited)')
     parser.add_argument('--render-dpi', type=int, default=200,
                        help='DPI for rendering pages to images (default: 200)')
-    parser.add_argument('--skip-existing', action='store_true',
-                       help='Skip patents that already have output files')
+    parser.add_argument('--no-skip', action='store_true',
+                       help='Re-process patents even if output files exist (default: skip existing)')
     parser.add_argument('--claims-only', action='store_true',
                        help='Extract only claims section (fast, no Vision AI for figures)')
+    parser.add_argument('--budget', type=int, default=200,
+                       help='Max API calls per patent (default: 200, 0=unlimited)')
+    parser.add_argument('--ocr-engine', choices=['auto', 'tesseract', 'vision'],
+                       default='auto',
+                       help='OCR engine for scanned PDFs: auto (Tesseract if available), '
+                            'tesseract (local only), vision (API only) (default: auto)')
+    parser.add_argument('--naming', choices=['default', 'detailed', 'dated'],
+                       default='default',
+                       help='Output filename scheme: default (patent_ID), '
+                            'detailed (patent_ID_applicant_title), '
+                            'dated (pubdate_ID_title) (default: default)')
+    parser.add_argument('--recursive', action='store_true',
+                       help='Recursively search input folder for PDF files')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose/debug logging')
 
@@ -1971,7 +2659,10 @@ def main():
         parser.error("Either --single or --input must be provided")
 
     try:
-        pipeline = PatentPipeline(output_dir=args.output)
+        pipeline = PatentPipeline(output_dir=args.output, budget=args.budget,
+                                   ocr_engine=args.ocr_engine,
+                                   naming=args.naming,
+                                   recursive=args.recursive)
         pipeline.RENDER_DPI = args.render_dpi
 
         if args.single:
@@ -1984,7 +2675,7 @@ def main():
                 no_vision=args.no_vision or args.claims_only,
                 claims_only=args.claims_only,
                 max_figure_pages=args.max_figure_pages,
-                skip_existing=False
+                skip_existing=not args.no_skip
             )
         else:
             input_path = Path(args.input)
@@ -1994,7 +2685,7 @@ def main():
             pipeline.process_all_patents(
                 input_path, no_vision=args.no_vision,
                 max_figure_pages=args.max_figure_pages,
-                skip_existing=args.skip_existing
+                skip_existing=not args.no_skip
             )
 
     except Exception as e:

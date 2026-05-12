@@ -72,16 +72,47 @@ class PosterPipeline:
     STRUCTURE_VISION_DPI = 300
     DEFAULT_OCR_DPI = 200
 
-    def __init__(self, sharepoint_folder: str, metadata_excel: str, output_dir: str = "output", recursive: bool = False):
+    NAMING_SCHEMES = {
+        'default': 'poster_{poster_num}',
+        'standardized': 'Poster_{author}_{conference}_{year}_{title_slug}',
+    }
+
+    DEFAULT_SHEET = 'Full_Program_Copy'
+
+    DEFAULT_COLUMN_MAP = {
+        'poster_number': ['Presentation Number', 'Poster Number', 'Abstract Number', 'Session Number'],
+        'title': 'Presentation Title',
+        'authors': 'authors',
+        'institution': 'institution',
+        'session_number': 'Session Number',
+        'session_title': 'Session Title',
+        'session_type': 'Session Type Name',
+        'day': 'Day',
+        'session_start': 'Session Start',
+        'session_end': 'Session End',
+        'location': 'Location',
+        'covered_by': 'Covered by',
+        'interested': 'Interested Colleagues',
+    }
+
+    def __init__(self, sharepoint_folder: str, metadata_excel: str = None, output_dir: str = "output",
+                 recursive: bool = False, naming: str = 'default', conference: str = None, year: str = None,
+                 sheet: str = None, column_overrides: dict = None):
         self.sharepoint_folder = Path(sharepoint_folder)
-        self.metadata_excel = Path(metadata_excel)
+        self.metadata_excel = Path(metadata_excel) if metadata_excel else None
         self.output_dir = Path(output_dir)
         self.recursive = recursive
-        self.figures_dir = self.output_dir / "figures"
+        self.naming = naming
+        self.conference = conference
+        self.year = year
 
-        # Create output directories
+        self.sheet = sheet or self.DEFAULT_SHEET
+        self.column_map = dict(self.DEFAULT_COLUMN_MAP)
+        if column_overrides:
+            self.column_map.update(column_overrides)
+
+        # Create output directory
         self.output_dir.mkdir(exist_ok=True)
-        self.figures_dir.mkdir(exist_ok=True)
 
         # Initialize quality log file
         self.quality_log_path = self.output_dir / "quality_log.txt"
@@ -99,8 +130,13 @@ class PosterPipeline:
             if os.path.exists(tessdata_dir):
                 os.environ['TESSDATA_PREFIX'] = tessdata_dir
 
-        # Validate Excel metadata file
-        self._validate_metadata_file()
+        # Validate Excel metadata file (or proceed without it)
+        if self.metadata_excel:
+            self._validate_metadata_file()
+        else:
+            self._metadata_df = None
+            logger.info("Unfortunately, no additional metadata is available for the poster extraction. "
+                        "Poster extraction proceeds without additional information.")
 
     def list_pdf_files(self) -> List[Path]:
         """List all PDF files in the SharePoint folder"""
@@ -123,15 +159,32 @@ class PosterPipeline:
 
         try:
             import pandas as pd
-            self._metadata_df = pd.read_excel(self.metadata_excel, sheet_name='Full_Program_Copy')
+
+            xl = pd.ExcelFile(self.metadata_excel)
+            if self.sheet not in xl.sheet_names:
+                raise ValueError(
+                    f"Sheet '{self.sheet}' not found in {self.metadata_excel.name}. "
+                    f"Available sheets: {', '.join(xl.sheet_names)}"
+                )
+
+            self._metadata_df = pd.read_excel(self.metadata_excel, sheet_name=self.sheet)
 
             if self._metadata_df.empty:
                 logger.warning("Excel metadata file is empty")
             else:
-                logger.info(f"✓ Excel metadata loaded: {len(self._metadata_df)} rows")
+                logger.info(f"✓ Excel metadata loaded: {len(self._metadata_df)} rows from sheet '{self.sheet}'")
+                available = set(self._metadata_df.columns)
+                for role, col_name in self.column_map.items():
+                    names = col_name if isinstance(col_name, list) else [col_name]
+                    found = [n for n in names if n in available]
+                    missing = [n for n in names if n not in available]
+                    if missing and not found:
+                        logger.info(f"  Column '{role}': configured as {missing} — not in spreadsheet (will be skipped)")
 
         except ImportError:
             raise ImportError("pandas not installed. Install with: conda install pandas openpyxl")
+        except ValueError:
+            raise
         except Exception as e:
             raise ValueError(f"Error validating Excel metadata: {e}")
 
@@ -177,9 +230,11 @@ class PosterPipeline:
     def _verify_poster_number_in_metadata(self, candidate: str) -> bool:
         """Check if a candidate poster number exists in the metadata."""
         if self._metadata_df is None or self._metadata_df.empty:
-            return True  # No metadata to verify against, accept the candidate
-        possible_columns = ['Presentation Number', 'Poster Number', 'Abstract Number']
-        for col_name in possible_columns:
+            return True
+        poster_num_cols = self.column_map['poster_number']
+        if isinstance(poster_num_cols, str):
+            poster_num_cols = [poster_num_cols]
+        for col_name in poster_num_cols:
             if col_name in self._metadata_df.columns:
                 if any(self._metadata_df[col_name].astype(str).str.strip() == str(candidate)):
                     return True
@@ -190,11 +245,21 @@ class PosterPipeline:
         if self._metadata_df is None or self._metadata_df.empty:
             return []
 
+        title_col = self.column_map['title']
+        poster_num_cols = self.column_map['poster_number']
+        if isinstance(poster_num_cols, str):
+            poster_num_cols = [poster_num_cols]
+
         html_tag_re = re.compile(r'<[^>]+>')
         cache = []
         for _, row in self._metadata_df.iterrows():
-            title = str(row.get('Presentation Title', ''))
-            pres_num = str(row.get('Presentation Number', ''))
+            title = str(row.get(title_col, ''))
+            pres_num = ''
+            for col in poster_num_cols:
+                val = str(row.get(col, ''))
+                if val and val != 'nan':
+                    pres_num = val
+                    break
             if not title or title == 'nan' or not pres_num or pres_num == 'nan':
                 continue
             cleaned = html_tag_re.sub('', title).strip()
@@ -2253,7 +2318,8 @@ Output format:
         # YAML-style metadata header
         title = sections.get('title', '')
         if metadata_row:
-            meta_title = metadata_row.get('Presentation Title') or metadata_row.get('title')
+            title_col = self.column_map['title']
+            meta_title = metadata_row.get(title_col) or metadata_row.get('title')
             if meta_title and str(meta_title) != 'nan':
                 title = re.sub(r'<[^>]+>', '', str(meta_title)).strip()
         if structure and structure.get('title'):
@@ -2262,38 +2328,33 @@ Output format:
         md.append("---\n")
         md.append(f"poster_number: {poster_num}\n")
         if metadata_row:
-            # Add all available metadata fields
-            # Interested Colleagues
-            for col in ['Interested Colleagues', 'interested_people', 'Interested People', 'interested', 'contacts']:
+            interested_col = self.column_map['interested']
+            if interested_col != self.DEFAULT_COLUMN_MAP['interested']:
+                cols_to_try = [interested_col] if isinstance(interested_col, str) else interested_col
+            else:
+                cols_to_try = ['Interested Colleagues', 'interested_people', 'Interested People', 'interested', 'contacts']
+            for col in cols_to_try:
                 if col in metadata_row and metadata_row[col] and str(metadata_row[col]) != 'nan':
                     md.append(f"interested_colleagues: {metadata_row[col]}\n")
                     break
 
-            # Covered by
-            if 'Covered by' in metadata_row and metadata_row['Covered by'] and str(metadata_row['Covered by']) != 'nan':
-                md.append(f"covered_by: {metadata_row['Covered by']}\n")
+            cov_col = self.column_map['covered_by']
+            if cov_col in metadata_row and metadata_row[cov_col] and str(metadata_row[cov_col]) != 'nan':
+                md.append(f"covered_by: {metadata_row[cov_col]}\n")
 
-            # Session information
-            if 'Session Number' in metadata_row and metadata_row['Session Number'] and str(metadata_row['Session Number']) != 'nan':
-                md.append(f"session_number: {metadata_row['Session Number']}\n")
-
-            if 'Session Title' in metadata_row and metadata_row['Session Title'] and str(metadata_row['Session Title']) != 'nan':
-                md.append(f"session_title: {metadata_row['Session Title']}\n")
-
-            if 'Session Type Name' in metadata_row and metadata_row['Session Type Name'] and str(metadata_row['Session Type Name']) != 'nan':
-                md.append(f"session_type: {metadata_row['Session Type Name']}\n")
-
-            if 'Day' in metadata_row and metadata_row['Day'] and str(metadata_row['Day']) != 'nan':
-                md.append(f"day: {metadata_row['Day']}\n")
-
-            if 'Session Start' in metadata_row and metadata_row['Session Start'] and str(metadata_row['Session Start']) != 'nan':
-                md.append(f"session_start: {metadata_row['Session Start']}\n")
-
-            if 'Session End' in metadata_row and metadata_row['Session End'] and str(metadata_row['Session End']) != 'nan':
-                md.append(f"session_end: {metadata_row['Session End']}\n")
-
-            if 'Location' in metadata_row and metadata_row['Location'] and str(metadata_row['Location']) != 'nan':
-                md.append(f"location: {metadata_row['Location']}\n")
+            session_fields = [
+                ('session_number', 'session_number'),
+                ('session_title', 'session_title'),
+                ('session_type', 'session_type'),
+                ('day', 'day'),
+                ('session_start', 'session_start'),
+                ('session_end', 'session_end'),
+                ('location', 'location'),
+            ]
+            for yaml_key, role in session_fields:
+                col = self.column_map[role]
+                if col in metadata_row and metadata_row[col] and str(metadata_row[col]) != 'nan':
+                    md.append(f"{yaml_key}: {metadata_row[col]}\n")
 
         md.append(f"extraction_method: {extraction_method}\n")
         md.append(f"vision_model: {self.VISION_MODEL}\n")
@@ -2310,16 +2371,24 @@ Output format:
 
         md.append(f"**Poster Number**: #{poster_num}\n\n")
 
+        authors = None
+        affiliation = None
         if metadata_row:
-            if 'authors' in metadata_row and metadata_row['authors']:
-                md.append(f"**Authors**: {metadata_row['authors']}\n\n")
-            elif structure and structure.get('authors'):
-                md.append(f"**Authors**: {structure['authors']}\n\n")
+            auth_col = self.column_map['authors']
+            inst_col = self.column_map['institution']
+            if auth_col in metadata_row and metadata_row[auth_col] and str(metadata_row[auth_col]) != 'nan':
+                authors = metadata_row[auth_col]
+            if inst_col in metadata_row and metadata_row[inst_col] and str(metadata_row[inst_col]) != 'nan':
+                affiliation = metadata_row[inst_col]
+        if not authors and structure and structure.get('authors'):
+            authors = structure['authors']
+        if not affiliation and structure and structure.get('affiliation'):
+            affiliation = structure['affiliation']
 
-            if 'institution' in metadata_row and metadata_row['institution']:
-                md.append(f"**Institution**: {metadata_row['institution']}\n\n")
-            elif structure and structure.get('affiliation'):
-                md.append(f"**Affiliation**: {structure['affiliation']}\n\n")
+        if authors:
+            md.append(f"**Authors**: {authors}\n\n")
+        if affiliation:
+            md.append(f"**Affiliation**: {affiliation}\n\n")
 
         md.append("---\n\n")
 
@@ -2553,9 +2622,66 @@ Output format:
 
         return ''.join(md)
 
-    def generate_filename(self, poster_num: str, metadata_row: Optional[Dict]) -> str:
-        """Generate output filename: poster_{NUM}.md"""
-        return f"poster_{poster_num}.md"
+    def _extract_first_author_lastname(self, authors_str: str) -> str:
+        """Extract last name of first author from an authors string."""
+        if not authors_str or str(authors_str) == 'nan':
+            return "Unknown"
+        first_author = authors_str.split(',')[0].strip()
+        parts = first_author.split()
+        if not parts:
+            return "Unknown"
+        lastname = parts[-1].rstrip('¹²³⁴⁵⁶⁷⁸⁹⁰*†‡§')
+        return re.sub(r'[^a-zA-Z]', '', lastname) or "Unknown"
+
+    def _sanitize_filename_part(self, text: str) -> str:
+        """Remove special characters and join words with underscores."""
+        clean = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+        return '_'.join(clean.split())
+
+    def generate_filename(self, poster_num: str, metadata_row: Optional[Dict], structure: Dict = None) -> str:
+        """Generate output filename based on naming scheme."""
+        if self.naming == 'default':
+            return f"poster_{poster_num}.md"
+
+        # Standardized naming: Poster_{Author}_{Conference}_{Year}_{Title}.md
+        authors_str = None
+        auth_col = self.column_map['authors']
+        if metadata_row and metadata_row.get(auth_col) and str(metadata_row.get(auth_col)) != 'nan':
+            authors_str = metadata_row[auth_col]
+        if not authors_str and structure and structure.get('authors'):
+            authors_str = structure['authors']
+        author = self._extract_first_author_lastname(authors_str)
+
+        conference = self._sanitize_filename_part(self.conference) if self.conference else "NoConference"
+
+        year = self.year
+        if not year and metadata_row:
+            for col in [self.column_map['day'], self.column_map['session_start']]:
+                val = metadata_row.get(col)
+                if val and str(val) != 'nan':
+                    year_match = re.search(r'20\d{2}', str(val))
+                    if year_match:
+                        year = year_match.group(0)
+                        break
+        if not year:
+            year = "NoYear"
+
+        title = None
+        if structure and structure.get('title'):
+            title = structure['title']
+        elif metadata_row:
+            title_col = self.column_map['title']
+            meta_title = metadata_row.get(title_col) or metadata_row.get('title')
+            if meta_title and str(meta_title) != 'nan':
+                title = re.sub(r'<[^>]+>', '', str(meta_title)).strip()
+        if not title:
+            title = poster_num
+
+        title_clean = re.sub(r'[^a-zA-Z0-9\s]', '', title)
+        title_words = title_clean.split()[:5]
+        title_slug = '_'.join(w for w in title_words) or poster_num
+
+        return f"Poster_{author}_{conference}_{year}_{title_slug}.md"
 
     def process_single_poster(self, pdf_path: Path, metadata_df=None,
                              force_ocr: bool = False, skip_existing: bool = True,
@@ -2592,11 +2718,13 @@ Output format:
             logger.info(f"Poster {poster_num} already processed - skipping")
             return True
 
-        # Get metadata (REQUIRED)
+        # Get metadata (if available)
         metadata_row = None
         if metadata_df is not None:
-            # Try multiple possible column names for poster number
-            possible_columns = ['Session Number', 'Presentation Number', 'Poster Number', 'Abstract Number']
+            # Try configured column names for poster number
+            possible_columns = self.column_map['poster_number']
+            if isinstance(possible_columns, str):
+                possible_columns = [possible_columns]
 
             matched = False
             for col_name in possible_columns:
@@ -2765,7 +2893,7 @@ Output format:
         )
 
         # Save output
-        output_filename = self.generate_filename(poster_num, metadata_row)
+        output_filename = self.generate_filename(poster_num, metadata_row, structure=structure)
         output_path = self.output_dir / output_filename
 
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -2812,11 +2940,8 @@ Output format:
         else:
             logger.info(f"Appending to existing quality log: {self.quality_log_path}")
 
-        # Load metadata (REQUIRED)
+        # Load metadata (optional - pipeline continues without it)
         metadata_df = self.load_metadata()
-        if metadata_df is None:
-            logger.error("Failed to load metadata - cannot proceed")
-            return
 
         # Get all PDFs
         pdf_files = self.list_pdf_files()
@@ -2911,8 +3036,8 @@ def main():
     )
     parser.add_argument('--sharepoint', type=str, required=True,
                        help='Path to SharePoint folder containing PDFs')
-    parser.add_argument('--metadata', type=str, required=True,
-                       help='Path to Excel metadata file (REQUIRED reference data)')
+    parser.add_argument('--metadata', type=str, required=False, default=None,
+                       help='Path to Excel metadata file (optional, enriches output with session info)')
     parser.add_argument('--output', type=str, default='output',
                        help='Output directory for markdown files (default: output)')
     parser.add_argument('--force-ocr', action='store_true',
@@ -2927,8 +3052,74 @@ def main():
                        help='Disable two-stage detailed figure analysis (faster but less detail)')
     parser.add_argument('--recursive', action='store_true',
                        help='Recursively search subfolders for PDF files')
+    parser.add_argument('--naming', default='default',
+                       choices=['default', 'standardized'],
+                       help="Output filename scheme: "
+                            "'default' = poster_{NUM}; "
+                            "'standardized' = Poster_{Author}_{Conference}_{Year}_{Title}")
+    parser.add_argument('--conference', type=str, default=None,
+                       help='Conference name for standardized naming (e.g., AACR, ASCO)')
+    parser.add_argument('--year', type=str, default=None,
+                       help='Year for standardized naming (e.g., 2026)')
+
+    col_group = parser.add_argument_group('Metadata Column Configuration',
+        'Map logical roles to actual Excel column names. Only specify columns that differ from defaults.')
+    col_group.add_argument('--sheet', type=str, default=None,
+                           help='Excel sheet name (default: Full_Program_Copy)')
+    col_group.add_argument('--col-poster-number', type=str, default=None,
+                           help='Comma-separated columns for poster number matching '
+                                '(default: "Presentation Number,Poster Number,Abstract Number,Session Number")')
+    col_group.add_argument('--col-title', type=str, default=None,
+                           help='Title column (default: "Presentation Title")')
+    col_group.add_argument('--col-authors', type=str, default=None,
+                           help='Authors column (default: "authors")')
+    col_group.add_argument('--col-institution', type=str, default=None,
+                           help='Institution/affiliation column (default: "institution")')
+    col_group.add_argument('--col-session-number', type=str, default=None,
+                           help='Session number column (default: "Session Number")')
+    col_group.add_argument('--col-session-title', type=str, default=None,
+                           help='Session title column (default: "Session Title")')
+    col_group.add_argument('--col-session-type', type=str, default=None,
+                           help='Session type column (default: "Session Type Name")')
+    col_group.add_argument('--col-day', type=str, default=None,
+                           help='Day/date column (default: "Day")')
+    col_group.add_argument('--col-session-start', type=str, default=None,
+                           help='Session start time column (default: "Session Start")')
+    col_group.add_argument('--col-session-end', type=str, default=None,
+                           help='Session end time column (default: "Session End")')
+    col_group.add_argument('--col-location', type=str, default=None,
+                           help='Location column (default: "Location")')
+    col_group.add_argument('--col-covered-by', type=str, default=None,
+                           help='Coverage person column (default: "Covered by")')
+    col_group.add_argument('--col-interested', type=str, default=None,
+                           help='Interested people column (default: "Interested Colleagues")')
 
     args = parser.parse_args()
+
+    # Build column overrides from CLI args
+    column_overrides = {}
+    cli_to_role = {
+        'col_poster_number': 'poster_number',
+        'col_title': 'title',
+        'col_authors': 'authors',
+        'col_institution': 'institution',
+        'col_session_number': 'session_number',
+        'col_session_title': 'session_title',
+        'col_session_type': 'session_type',
+        'col_day': 'day',
+        'col_session_start': 'session_start',
+        'col_session_end': 'session_end',
+        'col_location': 'location',
+        'col_covered_by': 'covered_by',
+        'col_interested': 'interested',
+    }
+    for cli_attr, role in cli_to_role.items():
+        val = getattr(args, cli_attr, None)
+        if val is not None:
+            if role == 'poster_number':
+                column_overrides[role] = [v.strip() for v in val.split(',')]
+            else:
+                column_overrides[role] = val
 
     try:
         # Initialize pipeline
@@ -2937,7 +3128,12 @@ def main():
             sharepoint_folder=args.sharepoint,
             metadata_excel=args.metadata,
             output_dir=args.output,
-            recursive=args.recursive
+            recursive=args.recursive,
+            naming=args.naming,
+            conference=args.conference,
+            year=args.year,
+            sheet=args.sheet,
+            column_overrides=column_overrides if column_overrides else None,
         )
 
         # Process
