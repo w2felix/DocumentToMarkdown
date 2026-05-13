@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from datetime import datetime
 
@@ -493,15 +494,32 @@ class PresentationPipeline:
         if not encoded_images:
             return None
 
-        all_slides = []
         batches = [encoded_images[i:i+self.SLIDES_PER_BATCH]
                    for i in range(0, len(encoded_images), self.SLIDES_PER_BATCH)]
 
-        for batch_idx, batch in enumerate(batches):
-            batch_start = batch_idx * self.SLIDES_PER_BATCH
-            result = self._extract_slides_batch_vision(batch, batch_start)
-            all_slides.extend(result)
+        workers = min(self.MAX_CONCURRENT_BATCHES, len(batches))
+        results = [None] * len(batches)
 
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {}
+            for idx, batch in enumerate(batches):
+                batch_start = idx * self.SLIDES_PER_BATCH
+                future = executor.submit(self._extract_slides_batch_vision, batch, batch_start)
+                future_to_idx[future] = idx
+
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    batch_start = idx * self.SLIDES_PER_BATCH
+                    logger.error(f"Vision batch {batch_start+1}-{batch_start+len(batches[idx])} failed: {e}")
+                    results[idx] = []
+
+        all_slides = []
+        for r in results:
+            if r:
+                all_slides.extend(r)
         return all_slides
 
     def _convert_pdf_to_images(self, pdf_path: Path) -> List[Any]:
