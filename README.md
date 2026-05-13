@@ -11,7 +11,7 @@ Built for pharmaceutical research — handles conference posters, patent filings
 | **Poster** | Conference poster PDFs | Structured markdown with figures, sections, and metadata |
 | **Patent** | Patent filing PDFs (WO/EP/US) | Claims, chemical structures, SMILES, executive summaries |
 | **Talk** | Slide-based presentation PDFs | Slide-by-slide extraction with narrative summaries |
-| **Presentation** | PPTX + PDF presentations | Native text extraction, action items, chemical structures |
+| **Presentation** | PPTX + PDF presentations | Native text extraction, per-slide image descriptions, action items, chemical structures |
 
 Each pipeline produces a self-contained `.md` file with YAML frontmatter, making the output easy to search, filter, and integrate into knowledge bases.
 
@@ -143,10 +143,10 @@ output_presentations/
 
 | | Poster | Patent | Talk | Presentation |
 |---|--------|--------|------|--------------|
-| **Processing time** | 1.5–4 min | 2–3 min (text+vision), 3–5 min (scanned+Tesseract), ~15s text-only | 1.5–4 min | <1s text-only, 30–90s with vision |
-| **API calls per doc** | 4 + N figures | 10–48 (text-native), 8–35 (scanned+Tesseract) | 4–9 (scales with slide count) | 1–3 (smart gating), 0 text-only |
-| **Token usage per doc** | ~30K–60K | ~40K–120K | ~18K–35K | ~8K–20K |
-| **Vision AI pages** | All pages (mandatory) | ~10% of pages (selective) | All slides (mandatory) | Smart gating: only when visual content detected (requires PowerPoint for PPTX) |
+| **Processing time** | 1.5–4 min | 2–3 min (text+vision), 3–5 min (scanned+Tesseract), ~15s text-only | 1.5–4 min | <1s text-only, 30–90s with vision, 2–4 min image-heavy |
+| **API calls per doc** | 4 + N figures | 10–48 (text-native), 8–35 (scanned+Tesseract) | 4–9 (scales with slide count) | 1–3 (smart gating) + 5–15 (image enrichment), 0 text-only |
+| **Token usage per doc** | ~30K–60K | ~40K–120K | ~18K–35K | ~8K–20K (text-only), ~50K–120K (image-heavy) |
+| **Vision AI pages** | All pages (mandatory) | ~10% of pages (selective) | All slides (mandatory) | Smart gating: global analysis + per-slide image enrichment (requires PowerPoint for PPTX) |
 | **Text-only mode** | No | Yes (`--no-vision`) | No | Yes (`--no-vision`) |
 | **Claims-only mode** | No | Yes (`--claims-only`, ~5s) | No | No |
 | **Concurrency** | Up to 5 figure workers | Up to 3 batch workers | Up to 5 batch workers | Sequential |
@@ -164,6 +164,7 @@ output_presentations/
 | OCR pre-pass as RAG context | x | | x | |
 | Abstract matching from metadata | x | | x | |
 | Native PPTX text extraction | | | | x |
+| Per-slide image enrichment (auto-describes figures/screenshots) | | | | x |
 | Smart Vision AI gating (skip when not needed) | | | | x |
 | Language detection (EN/DE) + English output | | | | x |
 | Classification detection (3-signal) | | | | x |

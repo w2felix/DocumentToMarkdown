@@ -43,6 +43,13 @@ class PresentationPipeline:
     MAX_TOKENS_ANALYSIS = 4096
 
     MAX_FILE_SIZE_MB = 500  # Reject files larger than 500MB
+
+    # Image enrichment thresholds
+    IMAGE_MIN_BLOB_SIZE = 20_480   # 20KB — below this, likely icon/logo
+    IMAGE_MIN_WIDTH = 150          # pixels on-slide
+    IMAGE_MIN_HEIGHT = 100         # pixels on-slide
+    MAX_ENRICHMENT_SLIDES = 45     # cap slides sent for per-slide vision enrichment
+    ENRICHMENT_BATCH_SIZE = 3      # smaller batches for more reliable per-slide descriptions
     CLASSIFICATION_RANKS = {'public': 0, 'confidential': 1, 'secret': 2}
 
     SMILES_VALID_CHARS = re.compile(r'^[A-Za-z0-9@+\-\[\]()=#$/\\.%:]+$')
@@ -305,6 +312,7 @@ class PresentationPipeline:
                 'is_boilerplate': False,
                 'has_images': False,
                 'has_charts': False,
+                'meaningful_image_count': 0,
             }
 
             if slide.shapes.title and slide.shapes.title.text.strip():
@@ -323,6 +331,18 @@ class PresentationPipeline:
                 elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                     slide_data['has_images'] = True
                     total_images += 1
+                    try:
+                        blob = shape.image.blob
+                        blob_size = len(blob) if blob else 0
+                        from PIL import Image as PILImage
+                        with PILImage.open(BytesIO(blob)) as img_check:
+                            img_w, img_h = img_check.size
+                        if (blob_size >= self.IMAGE_MIN_BLOB_SIZE and
+                            img_w >= self.IMAGE_MIN_WIDTH and
+                            img_h >= self.IMAGE_MIN_HEIGHT):
+                            slide_data['meaningful_image_count'] += 1
+                    except Exception:
+                        slide_data['meaningful_image_count'] += 1
 
                 elif shape.shape_type in (MSO_SHAPE_TYPE.CHART, MSO_SHAPE_TYPE.IGX_GRAPHIC, MSO_SHAPE_TYPE.DIAGRAM):
                     slide_data['has_charts'] = True
@@ -731,6 +751,138 @@ Return ONLY valid JSON."""
             logger.error(f"Vision batch extraction failed: {e}")
 
         return []
+
+    def _enrich_pptx_slides_with_vision(self, slides_data: List[Dict],
+                                         slide_images: List[Any]) -> None:
+        """Enrich PPTX slides that have meaningful images with visual_elements descriptions."""
+        if not slide_images:
+            return
+
+        candidates = []
+        for i, slide in enumerate(slides_data):
+            if slide.get('is_boilerplate'):
+                continue
+            if slide.get('meaningful_image_count', 0) < 1:
+                continue
+            if i >= len(slide_images):
+                continue
+            if slide.get('visual_elements'):
+                continue
+            text_len = len(' '.join(slide.get('text_blocks', [])))
+            candidates.append((i, slide.get('meaningful_image_count', 0), text_len))
+
+        if not candidates:
+            logger.info("  Image enrichment: no slides with meaningful images to enrich")
+            return
+
+        candidates.sort(key=lambda x: (-x[1], x[2]))
+        candidates = candidates[:self.MAX_ENRICHMENT_SLIDES]
+
+        logger.info(f"  Image enrichment: {len(candidates)} slides selected for visual description")
+
+        indexed_encoded = []
+        for (slide_idx, _, _) in candidates:
+            b64, media_type = self.encode_image_to_base64(slide_images[slide_idx])
+            if b64:
+                indexed_encoded.append((slide_idx, b64, media_type))
+
+        if not indexed_encoded:
+            return
+
+        batches = [indexed_encoded[i:i+self.ENRICHMENT_BATCH_SIZE]
+                   for i in range(0, len(indexed_encoded), self.ENRICHMENT_BATCH_SIZE)]
+
+        workers = min(self.MAX_CONCURRENT_BATCHES, len(batches))
+        results = {}
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_batch = {}
+            for batch in batches:
+                future = executor.submit(self._enrich_batch_vision, batch)
+                future_to_batch[future] = batch
+
+            for future in as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                try:
+                    batch_results = future.result()
+                    results.update(batch_results)
+                except Exception as e:
+                    slide_nums = [slides_data[idx]['number'] for (idx, _, _) in batch]
+                    logger.error(f"  Image enrichment batch failed (slides {slide_nums}): {e}")
+
+        enriched_count = 0
+        for slide_idx, visual_elements in results.items():
+            if visual_elements and visual_elements.strip():
+                slides_data[slide_idx]['visual_elements'] = visual_elements
+                enriched_count += 1
+
+        logger.info(f"  Image enrichment: {enriched_count}/{len(candidates)} slides enriched")
+
+    def _enrich_batch_vision(self, batch: List[Tuple[int, str, str]]) -> Dict[int, str]:
+        """Send a batch of slide images to Vision API for visual element descriptions."""
+        client = self.get_anthropic_client()
+        if not client:
+            return {}
+
+        content_blocks = []
+        slide_indices = []
+        for slide_idx, img_b64, media_type in batch:
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": img_b64}
+            })
+            content_blocks.append({
+                "type": "text",
+                "text": f"[Slide {slide_idx + 1}]"
+            })
+            slide_indices.append(slide_idx)
+
+        prompt = """For each slide image above, describe the visual content (images, screenshots, figures, diagrams, photos) visible on the slide. Focus on:
+- What the images/figures depict (subject matter, data shown, UI elements)
+- Key information conveyed visually that text alone would not capture
+- Scientific figures: describe axes, data trends, and conclusions
+- Screenshots: describe the UI, workflow, or tool shown
+- Do NOT repeat text that is already readable on the slide
+
+Return a JSON array with one object per slide:
+[
+  {
+    "slide_number": <number>,
+    "visual_elements": "concise description of visual content"
+  }
+]
+Return ONLY valid JSON."""
+
+        content_blocks.append({"type": "text", "text": prompt})
+
+        try:
+            response = self._api_call_with_retry(
+                lambda: client.messages.create(
+                    model=self.VISION_MODEL,
+                    max_tokens=self.MAX_TOKENS_SLIDE_EXTRACTION,
+                    messages=[{"role": "user", "content": content_blocks}]
+                ),
+                description="Image enrichment batch"
+            )
+            results = self.parse_json_response(response.content[0].text)
+            if isinstance(results, list):
+                output = {}
+                num_to_idx = {slide_idx + 1: slide_idx for slide_idx in slide_indices}
+                for item in results:
+                    sn = item.get('slide_number')
+                    if sn and sn in num_to_idx:
+                        output[num_to_idx[sn]] = item.get('visual_elements', '')
+                    elif sn is None and len(results) == len(slide_indices):
+                        # No slide numbers returned — use positional only if count matches exactly
+                        output = {}
+                        for i, it in enumerate(results):
+                            output[slide_indices[i]] = it.get('visual_elements', '')
+                        break
+                return output
+        except Exception as e:
+            logger.error(f"Image enrichment batch failed: {e}")
+
+        return {}
 
     def detect_classification(self, filename: str, all_text: str) -> Tuple[str, List[str]]:
         signals = []
@@ -1725,6 +1877,16 @@ Format your response as:
         elif file_info.get('no_structures'):
             logger.info("  Skipping SMILES refinement ([No Structures] in filename)")
             chemical_structures = []
+
+        # Step 6b: Image enrichment for PPTX slides with meaningful embedded images
+        if (file_info['source_format'] == 'pptx' and
+            not self.no_vision and
+            slide_images and
+            content.get('has_visual_content')):
+            logger.info("\n--- Image enrichment (per-slide visual descriptions) ---")
+            self._enrich_pptx_slides_with_vision(content['slides'], slide_images)
+            if any(s.get('visual_elements') for s in content['slides']):
+                content['extraction_method'] = 'native_text+vision_enrichment'
 
         # Step 7: Summary generation (conditional)
         executive_summary = ''

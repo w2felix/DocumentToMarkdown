@@ -188,6 +188,30 @@ When enabled, analyzes representative slides for:
 
 **PDF**: Slides are rendered via PyMuPDF at 150 DPI.
 
+#### 6b. Per-Slide Image Enrichment (PPTX only)
+
+For PPTX files with embedded images, the pipeline identifies slides that contain **meaningful visual content** (not logos or icons) and sends their rendered slide images to Vision AI for per-slide descriptions.
+
+**Image filtering criteria** — an embedded image is considered "meaningful" if:
+- Blob size ≥ 20 KB (excludes tiny icons and logos)
+- Width ≥ 150 px AND height ≥ 100 px (excludes thin banners and decorative elements)
+
+**Processing:**
+- Slides are ranked by meaningful image count (descending), then text sparsity (ascending)
+- Up to 45 slides are sent for enrichment (batches of 3, up to 5 concurrent)
+- Each batch asks Vision AI to describe visual content without repeating slide text
+- Results are merged into the slide's `**Visual elements**` field in the output
+
+**What gets described:**
+- Scientific figures (axes, data trends, conclusions)
+- Screenshots (UI, workflow, tool shown)
+- Photos and diagrams (subject matter, key information)
+- Conference poster panels (mechanism diagrams, data plots)
+
+**Cost:** Typically 5–15 extra API calls for image-heavy presentations (~$0.10–0.30). Skipped entirely with `--no-vision`.
+
+When enrichment occurs, the `extraction_method` in frontmatter updates to `native_text+vision_enrichment`.
+
 #### 7. Chemical Structure SMILES Refinement
 
 For detected chemical structures with low/medium confidence:
@@ -228,6 +252,12 @@ Weighted 0-10 score with assessment labels, then full markdown output.
 - **PDF**: Triggers Vision AI fallback only when text is sparse (<50 chars/page average) or garbled (>20% pages with reversed/fragmented text)
 - Summary generation is always text-based (no images needed) — runs independently of vision gating
 - Net effect: a text-only PPTX → 1 API call (summary), not 2–3
+
+### Per-Slide Image Enrichment
+- PPTX slides with meaningful embedded images (scientific figures, screenshots, photos) get individual Vision AI descriptions
+- Smart filtering excludes logos, icons, and decorative elements using blob size (≥20KB) and dimensions (≥150×100px)
+- Descriptions are injected as `**Visual elements**` per slide — capturing information invisible to text extraction
+- Up to 45 slides enriched per presentation, processed in parallel batches of 3
 
 ### Language Detection
 - Lightweight heuristic: counts German vs English indicator words in slide text
@@ -294,7 +324,7 @@ has_speaker_notes: false
 has_chemical_structures: false
 has_action_items: true
 has_summary: true
-extraction_method: native_text
+extraction_method: native_text+vision_enrichment
 vision_model: claude-sonnet-4-6
 processing_date: 2026-05-12
 quality_overall: 8.3/10
@@ -318,6 +348,7 @@ quality_assessment: Excellent
 
 ### Slide 1: Title
 Text content...
+**Visual elements**: Description of embedded images, screenshots, or figures on this slide
 **Notes**: speaker notes if available
 
 ### Slide 2: Agenda
@@ -443,7 +474,8 @@ All presentations are saved regardless of quality score (unlike the poster pipel
 ### Processing Time
 
 - **PPTX (no-vision)**: <1 second per file
-- **PPTX (with vision)**: ~30-90 seconds (requires PowerPoint installed for slide rendering)
+- **PPTX (with vision, few images)**: ~30-90 seconds (requires PowerPoint installed for slide rendering)
+- **PPTX (with vision, image-heavy)**: ~2-4 minutes (includes per-slide image enrichment)
 - **PDF (native text)**: 2-5 seconds per file (PyMuPDF text + pdfplumber tables)
 - **PDF (with vision)**: ~30-90 seconds (when text is sparse/garbled and Vision AI fallback is triggered)
 
@@ -451,10 +483,11 @@ All presentations are saved regardless of quality score (unlike the poster pipel
 
 Each presentation makes approximately:
 - 0–1 API call for figure/audience/topic analysis (~4K tokens) — skipped for text-only PPTX with no images/charts
+- 0–15 API calls for per-slide image enrichment (~8K tokens each) — only for PPTX slides with meaningful embedded images
 - 0-N API calls for SMILES refinement (~1K tokens each)
 - 1 API call for executive summary + takeaways (~4K tokens) — only for substantive/operational content
 
-**Smart gating**: A text-only PPTX (no images or charts) uses 1 API call (summary only). A PPTX with figures uses 2–3 calls. A PDF with charts gets full vision analysis.
+**Smart gating**: A text-only PPTX (no images or charts) uses 1 API call (summary only). A PPTX with a few figures uses 2–3 calls. An image-heavy PPTX (scientific presentations with embedded poster figures) uses 10–18 calls including per-slide enrichment.
 
 **PPTX note**: Full Vision AI analysis requires PowerPoint installed for slide rendering. Without PowerPoint, PPTX still gets text-based summaries (1 API call).
 
