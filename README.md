@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="Doc2MD" width="150">
+</p>
+
 # DocumentToMarkdown
 
 Convert scientific documents into structured, searchable markdown using AI-powered vision analysis.

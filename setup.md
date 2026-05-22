@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="Doc2MD" width="150">
+</p>
+
 # Setup Guide
 
 Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk, presentation).
