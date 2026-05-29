@@ -27,9 +27,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load credentials from Windows User environment (with URL validation)
-from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, sanitize_filename
-load_credentials_from_registry()
+# Load credentials and shared auth
+from pipeline_security import validate_path, validate_output_path, sanitize_filename
+from auth import get_anthropic_client as _get_shared_client
 
 
 class PatentPipeline:
@@ -234,28 +234,14 @@ class PatentPipeline:
 
     # ─── Shared Utilities ──────────────────────────────────────────────────
 
-    def get_api_config(self) -> Tuple[Optional[str], Optional[str]]:
-        auth_token = os.environ.get('ANTHROPIC_AUTH_TOKEN')
-        base_url = os.environ.get('ANTHROPIC_BASE_URL')
-        if auth_token and base_url:
-            return auth_token, base_url
-        api_key = os.environ.get('ANTHROPIC_API_KEY')
-        if api_key:
-            return api_key, None
-        return None, None
-
     def get_anthropic_client(self):
         if self._client is not None:
             return self._client
-        from anthropic import Anthropic
-        api_key, base_url = self.get_api_config()
-        if not api_key:
+        try:
+            self._client = _get_shared_client()
+        except RuntimeError:
             logger.error("Cannot create Anthropic client - API credentials not found")
             return None
-        if base_url:
-            self._client = Anthropic(api_key=api_key, base_url=base_url)
-        else:
-            self._client = Anthropic(api_key=api_key)
         return self._client
 
     def _track_api_call(self, count: int = 1) -> bool:
@@ -324,7 +310,7 @@ class PatentPipeline:
         try:
             import fitz
             from PIL import Image
-            Image.MAX_IMAGE_PIXELS = None
+            Image.MAX_IMAGE_PIXELS = 300_000_000
             doc = fitz.open(str(pdf_path))
             try:
                 zoom = dpi / 72
@@ -2350,6 +2336,12 @@ Format your response EXACTLY as:
         logger.info(f"\n{'='*70}")
         logger.info(f"PATENT PIPELINE: {pdf_path.name}")
         logger.info(f"{'='*70}")
+
+        # File size check
+        file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
+        if file_size_mb > 500:
+            logger.error(f"  File too large: {file_size_mb:.1f}MB (max 500MB) — skipping")
+            return False
 
         self._api_call_count = 0
 

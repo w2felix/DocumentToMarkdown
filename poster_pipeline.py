@@ -27,9 +27,9 @@ from difflib import SequenceMatcher
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load credentials from Windows User environment (with URL validation)
-from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, check_excel_safe, sanitize_filename
-load_credentials_from_registry()
+# Load credentials and shared auth
+from pipeline_security import validate_path, validate_output_path, check_excel_safe, sanitize_filename
+from auth import get_anthropic_client as _get_shared_client
 
 
 class PosterPipeline:
@@ -46,6 +46,7 @@ class PosterPipeline:
     QUALITY_EXCELLENT_THRESHOLD = 8.0
     QUALITY_GOOD_THRESHOLD = 5.5  # Lowered from 6.0 to recover marginal posters
     QUALITY_FAIR_THRESHOLD = 4.0
+    MAX_PDF_SIZE_MB = 200
     MAX_TEMPLATE_PENALTY = 2.0
     TEMPLATE_PENALTY_PER_ARTIFACT = 0.5
     CAPTION_PENALTY_PER_CONTAMINATION = 2.0
@@ -374,7 +375,7 @@ class PosterPipeline:
             import pytesseract
             from PIL import Image
 
-            Image.MAX_IMAGE_PIXELS = None
+            Image.MAX_IMAGE_PIXELS = 300_000_000
             logger.info(f"Running OCR at {dpi} DPI...")
 
             images = convert_from_path(str(pdf_path), dpi=dpi)
@@ -456,7 +457,7 @@ class PosterPipeline:
             import fitz  # PyMuPDF
             from PIL import Image
 
-            Image.MAX_IMAGE_PIXELS = None
+            Image.MAX_IMAGE_PIXELS = 300_000_000
 
             doc = fitz.open(str(pdf_path))
             if len(doc) == 0:
@@ -497,7 +498,7 @@ class PosterPipeline:
             import fitz  # PyMuPDF
             from PIL import Image
 
-            Image.MAX_IMAGE_PIXELS = None
+            Image.MAX_IMAGE_PIXELS = 300_000_000
 
             doc = fitz.open(str(pdf_path))
             num_pages = len(doc)
@@ -739,46 +740,15 @@ Output ONLY the corrected, clean text in proper reading order. No commentary or 
             logger.error(f"Error encoding image: {e}")
             return None, None
 
-    def get_api_config(self):
-        """Get API configuration from environment"""
-        # Check for Foundry proxy (Merck)
-        auth_token = os.environ.get('ANTHROPIC_AUTH_TOKEN')
-        base_url = os.environ.get('ANTHROPIC_BASE_URL')
-
-        if auth_token and base_url:
-            logger.info("Using Foundry proxy configuration")
-            return auth_token, base_url
-
-        # Fallback to direct API
-        api_key = os.environ.get('ANTHROPIC_API_KEY')
-        if api_key:
-            logger.info("Using direct Anthropic API")
-            return api_key, None
-
-        logger.warning("No API configuration found in environment")
-        return None, None
-
     def get_anthropic_client(self):
-        """Get configured Anthropic client instance (cached).
-
-        Returns:
-            Anthropic client or None if credentials not available
-        """
+        """Get configured Anthropic client instance (cached via shared auth module)."""
         if self._client is not None:
             return self._client
-
-        from anthropic import Anthropic
-
-        api_key, base_url = self.get_api_config()
-        if not api_key:
+        try:
+            self._client = _get_shared_client()
+        except RuntimeError:
             logger.error("Cannot create Anthropic client - API credentials not found")
             return None
-
-        if base_url:
-            self._client = Anthropic(api_key=api_key, base_url=base_url)
-        else:
-            self._client = Anthropic(api_key=api_key)
-
         return self._client
 
     def extract_poster_structure_vision(self, pdf_path: Path, extracted_text: str = None, poster_image=None, encoded_image: Tuple[str, str] = None) -> Dict:
@@ -2705,6 +2675,12 @@ Output format:
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing: {pdf_path.name}")
         logger.info(f"{'='*60}")
+
+        # File size check
+        file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
+        if file_size_mb > self.MAX_PDF_SIZE_MB:
+            logger.error(f"  File too large: {file_size_mb:.1f}MB (max {self.MAX_PDF_SIZE_MB}MB) — skipping")
+            return False
 
         # Extract poster number
         poster_num = self.extract_poster_number(pdf_path)

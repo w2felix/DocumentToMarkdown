@@ -24,9 +24,9 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load credentials from Windows User environment (with URL validation)
-from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, check_pptx_safe, sanitize_filename
-load_credentials_from_registry()
+# Load credentials and shared auth
+from pipeline_security import validate_path, validate_output_path, check_pptx_safe, sanitize_filename
+from auth import get_anthropic_client as _get_shared_client
 
 
 class PresentationPipeline:
@@ -175,19 +175,11 @@ class PresentationPipeline:
     def get_anthropic_client(self):
         if self._client is not None:
             return self._client
-
-        from anthropic import Anthropic
-        auth_token = os.environ.get('ANTHROPIC_AUTH_TOKEN')
-        base_url = os.environ.get('ANTHROPIC_BASE_URL')
-
-        if auth_token and base_url:
-            self._client = Anthropic(api_key=auth_token, base_url=base_url)
-        elif os.environ.get('ANTHROPIC_API_KEY'):
-            self._client = Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-        else:
+        try:
+            self._client = _get_shared_client()
+        except RuntimeError:
             logger.error("API credentials not found")
             return None
-
         return self._client
 
     def _api_call_with_retry(self, call_fn, description: str = "API call"):

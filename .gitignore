@@ -26,10 +26,12 @@ scripts/claude-*-cwd
 
 # Output files
 output/
+output_papers/
 output_patents/
 output_talks/
 output_presentations/
 test_output_*/
+test_paper_output/
 figures/
 
 # Test data (PDFs, Excel, PPTX)

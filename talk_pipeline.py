@@ -21,9 +21,9 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load credentials from Windows User environment (with URL validation)
-from pipeline_security import load_credentials_from_registry, validate_path, validate_output_path, sanitize_filename
-load_credentials_from_registry()
+# Load credentials and shared auth
+from pipeline_security import validate_path, validate_output_path, sanitize_filename
+from auth import get_anthropic_client as _get_shared_client
 
 
 class TalkPipeline:
@@ -112,22 +112,14 @@ class TalkPipeline:
             f.write(entry)
 
     def get_anthropic_client(self):
-        """Get configured Anthropic client instance (cached)."""
+        """Get configured Anthropic client instance (cached via shared auth module)."""
         if self._client is not None:
             return self._client
-
-        from anthropic import Anthropic
-        auth_token = os.environ.get('ANTHROPIC_AUTH_TOKEN')
-        base_url = os.environ.get('ANTHROPIC_BASE_URL')
-
-        if auth_token and base_url:
-            self._client = Anthropic(api_key=auth_token, base_url=base_url)
-        elif os.environ.get('ANTHROPIC_API_KEY'):
-            self._client = Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-        else:
+        try:
+            self._client = _get_shared_client()
+        except RuntimeError:
             logger.error("API credentials not found")
             return None
-
         return self._client
 
     def list_talk_files(self) -> List[Path]:
@@ -216,7 +208,7 @@ class TalkPipeline:
             import fitz
             from PIL import Image
 
-            Image.MAX_IMAGE_PIXELS = None
+            Image.MAX_IMAGE_PIXELS = 300_000_000
             doc = fitz.open(str(pdf_path))
             try:
                 num_pages = len(doc)
@@ -657,6 +649,12 @@ SECTION 2: Key Takeaways (4-7 bullet points)
         logger.info(f"Processing: {pdf_path.name}")
         logger.info(f"{'='*60}")
 
+        # File size check
+        file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
+        if file_size_mb > 500:
+            logger.error(f"  File too large: {file_size_mb:.1f}MB (max 500MB) — skipping")
+            return False
+
         # Step 1: Parse filename
         file_info = self.parse_filename(pdf_path)
         logger.info(f"  Speaker: {file_info['speaker_formatted']}")
@@ -793,7 +791,7 @@ def main():
         description="Process scientific talk PDFs into structured markdown using Vision AI"
     )
     parser.add_argument("--input", "--talks", dest="talks",
-                       default=r"C:\Users\M286901\OneDrive - MerckGroup\Conference Platform - Talks",
+                       type=str, required=True,
                        help="Folder containing talk PDFs")
     parser.add_argument("--metadata", default=r"test_poster\AACR2026_Abstracts.xlsx",
                        help="Excel file with abstract metadata")
