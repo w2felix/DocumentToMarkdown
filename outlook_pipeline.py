@@ -12,7 +12,6 @@ import re
 import json
 import html
 import argparse
-import tempfile
 import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -92,8 +91,9 @@ class OutlookPipeline:
         try:
             import pythoncom
             pythoncom.CoInitialize()
+            self._pythoncom = pythoncom
         except ImportError:
-            pass
+            self._pythoncom = None
 
         try:
             import win32com.client
@@ -101,6 +101,8 @@ class OutlookPipeline:
             namespace = outlook.GetNamespace("MAPI")
             return namespace
         except Exception as e:
+            if self._pythoncom:
+                self._pythoncom.CoUninitialize()
             raise RuntimeError(
                 f"Cannot connect to Outlook. Is Outlook running?\n"
                 f"Error: {e}\n"
@@ -387,21 +389,30 @@ class OutlookPipeline:
 
         return body, None
 
+    MEETING_INVITE_MAX_LINES = 35
+
     def _strip_meeting_invite(self, text: str) -> str:
         """Remove Teams/Zoom/Google meeting invite blocks from text."""
-        # Remove block starting from meeting markers to end or next delimiter
         lines = text.split('\n')
         result = []
         skip = False
+        skip_line_count = 0
         for line in lines:
             if self.MEETING_INVITE_RE.search(line):
                 skip = True
+                skip_line_count = 0
                 continue
-            if skip and (line.strip().startswith('___') or line.strip().startswith('---')):
-                skip = False
+            if skip:
+                stripped = line.strip()
+                if stripped.startswith('___') or stripped.startswith('---'):
+                    skip = False
+                    continue
+                skip_line_count += 1
+                if skip_line_count > self.MEETING_INVITE_MAX_LINES:
+                    skip = False
+                    result.append(line)
                 continue
-            if not skip:
-                result.append(line)
+            result.append(line)
         return '\n'.join(result)
 
     def _strip_quoted_emails(self, text: str) -> str:
@@ -415,10 +426,17 @@ class OutlookPipeline:
         while i < len(lines):
             line = lines[i]
             if re.match(r'^(?:From|Von|De)\s*:', line, re.IGNORECASE):
+                # Look ahead skipping blank lines — Outlook puts blanks between header fields
                 header_count = 1
-                for j in range(i + 1, min(i + 6, len(lines))):
+                non_blank_checked = 0
+                for j in range(i + 1, min(i + 20, len(lines))):
+                    if not lines[j].strip():
+                        continue
                     if quoted_header_re.match(lines[j]):
                         header_count += 1
+                    non_blank_checked += 1
+                    if non_blank_checked >= 6:
+                        break
                 if header_count >= 3:
                     return '\n'.join(lines[:i]).strip()
             i += 1
@@ -433,8 +451,10 @@ class OutlookPipeline:
         # Strip quoted email chains
         sig = self._strip_quoted_emails(sig)
 
-        # Strip mandatory/privacy notices
-        sig = self.MANDATORY_INFO_RE.sub('', sig)
+        # Strip mandatory/privacy notices (truncate at match point, don't erase mid-string)
+        m = self.MANDATORY_INFO_RE.search(sig)
+        if m:
+            sig = sig[:m.start()]
 
         # Remove urldefense wrappers: [text](url) → text
         sig = re.sub(r'\[([^\]]+)\]\(https?://urldefense[^)]+\)', r'\1', sig)
@@ -462,31 +482,37 @@ class OutlookPipeline:
 
         return sig.strip()
 
+    _SIGNOFF_RE = re.compile(
+        r'^(?:Best regards|Kind regards|Regards|Thanks|Cheers|Sincerely|'
+        r'Mit freundlichen Gr[uü][sß]en|Viele Gr[uü][sß]e|MfG|VG|BR)',
+        re.IGNORECASE
+    )
+
     def _identify_signature_owner(self, sig: str, fallback_name: str) -> str:
         """Extract the person's name from the signature content itself."""
-        lines = [l.strip() for l in sig.split('\n') if l.strip()]
-        # Skip sign-off line (Best regards, Thanks, etc.)
-        start = 0
-        for i, line in enumerate(lines):
-            if re.match(
-                r'^(?:Best regards|Kind regards|Regards|Thanks|Cheers|Sincerely|'
-                r'Mit freundlichen Gr[uü][sß]en|Viele Gr[uü][sß]e|MfG|VG|BR)',
-                line, re.IGNORECASE
-            ):
-                start = i + 1
-                continue
-            # Also skip single first-name lines right after greeting (e.g. "Carsten")
-            if i == start and len(line.split()) == 1 and line[0].isupper() and len(line) < 20:
-                start = i + 1
-                continue
-            break
+        non_empty = [l.strip() for l in sig.split('\n') if l.strip()]
 
-        # The name is typically the first non-empty line after the sign-off
-        for line in lines[start:]:
+        # Pass 1: skip sign-off greeting and the optional single first-name after it
+        start = 0
+        while start < len(non_empty):
+            line = non_empty[start]
+            if self._SIGNOFF_RE.match(line):
+                start += 1
+                # Skip a lone first name immediately after the greeting
+                if (start < len(non_empty) and
+                        len(non_empty[start].split()) == 1 and
+                        non_empty[start][0].isupper() and
+                        len(non_empty[start]) < 20):
+                    start += 1
+            else:
+                break
+
+        # Pass 2: first remaining line that looks like a person name
+        for line in non_empty[start:]:
             if (len(line) < 50 and
-                not any(x in line.lower() for x in ['|', 'phone:', 'e-mail:', 'www.', 'http', '@']) and
-                not line.startswith('+') and
-                not re.match(r'^[\d\s\-\(\)]+$', line)):
+                    not any(x in line.lower() for x in ['|', 'phone:', 'e-mail:', 'www.', 'http', '@']) and
+                    not line.startswith('+') and
+                    not re.match(r'^[\d\s\-\(\)]+$', line)):
                 return line
 
         return fallback_name
@@ -521,7 +547,7 @@ class OutlookPipeline:
 
     def _extract_body(self, snap: Dict) -> str:
         """Extract email body from snapshot as plain text or converted markdown."""
-        if snap['body']:
+        if snap['body'].strip():
             text = snap['body']
         elif snap['html_body'] and snap['html_body'].strip():
             text = self._html_to_text(snap['html_body'])
@@ -589,6 +615,14 @@ class OutlookPipeline:
                 staged_path.unlink(missing_ok=True)
                 continue
 
+            # Check size before moving — discard oversized files without placing in output
+            size_bytes = staged_path.stat().st_size
+            size_mb = size_bytes / (1024 * 1024)
+            if size_mb > self.MAX_ATTACHMENT_SIZE_MB:
+                logger.warning(f"Attachment too large ({size_mb:.1f}MB): {filename}")
+                staged_path.unlink(missing_ok=True)
+                continue
+
             dest_path = thread_dir / filename
             if dest_path.exists():
                 stem = dest_path.stem
@@ -604,19 +638,6 @@ class OutlookPipeline:
                 import shutil
                 shutil.move(str(staged_path), str(dest_path))
 
-            size_mb = dest_path.stat().st_size / (1024 * 1024)
-            if size_mb > self.MAX_ATTACHMENT_SIZE_MB:
-                logger.warning(f"Attachment too large ({size_mb:.1f}MB): {filename}")
-                attachments_info.append({
-                    'filename': dest_path.name,
-                    'path': dest_path,
-                    'size_mb': size_mb,
-                    'type': 'too_large',
-                    'processed': False,
-                    'output': None,
-                })
-                continue
-
             att_type = self.ATTACHMENT_PIPELINES.get(ext, 'raw')
             if ext in self.IMAGE_EXTENSIONS:
                 att_type = 'image'
@@ -624,6 +645,7 @@ class OutlookPipeline:
             attachments_info.append({
                 'filename': dest_path.name,
                 'path': dest_path,
+                'size_bytes': size_bytes,
                 'size_mb': size_mb,
                 'type': att_type,
                 'processed': False,
@@ -755,6 +777,22 @@ class OutlookPipeline:
             logger.warning(f"Vision AI extraction failed for {file_path.name}: {e}")
             return self._process_pdf_as_paper(file_path, thread_dir, output_name)
 
+    def _rename_newest_md(self, thread_dir: Path, output_name: str,
+                          excluded: tuple = ('thread', 'signatures')) -> Optional[str]:
+        """Find the most recently modified .md file in thread_dir and rename it to output_name."""
+        candidates = [
+            f for f in thread_dir.glob('*.md')
+            if f.stem not in excluded and f.name != output_name
+        ]
+        if not candidates:
+            # Output was already named correctly
+            if (thread_dir / output_name).exists():
+                return output_name
+            return None
+        newest = max(candidates, key=lambda f: f.stat().st_mtime)
+        newest.rename(thread_dir / output_name)
+        return output_name
+
     def _process_pdf_as_paper(self, file_path: Path, thread_dir: Path,
                               output_name: str) -> Optional[str]:
         """Process a multi-page PDF through the paper pipeline."""
@@ -765,12 +803,7 @@ class OutlookPipeline:
                 output_dir=str(thread_dir),
             )
             pipeline.process_single_paper(file_path, skip_existing=False)
-            for f in thread_dir.glob('*.md'):
-                if f.stem != 'thread' and f.stem != 'signatures' and file_path.stem.lower() in f.stem.lower():
-                    if f.name != output_name:
-                        f.rename(thread_dir / output_name)
-                    return output_name
-            return None
+            return self._rename_newest_md(thread_dir, output_name)
         except ImportError:
             logger.warning("paper_pipeline not available for PDF processing")
             return None
@@ -785,12 +818,7 @@ class OutlookPipeline:
                 output_dir=str(thread_dir),
             )
             pipeline.process_single_presentation(file_path, skip_existing=False)
-            for f in thread_dir.glob('*.md'):
-                if f.stem != 'thread' and file_path.stem.lower() in f.stem.lower():
-                    if f.name != output_name:
-                        f.rename(thread_dir / output_name)
-                    return output_name
-            return None
+            return self._rename_newest_md(thread_dir, output_name)
         except ImportError:
             logger.warning("presentation_pipeline not available for PPTX processing")
             return None
@@ -860,8 +888,8 @@ class OutlookPipeline:
 
     def _generate_thread_markdown(self, thread_id: str, emails: List[Dict],
                                   all_attachments: Dict[str, List[Dict]],
-                                  folder_path: str) -> str:
-        """Generate the full thread.md content from snapshot dicts."""
+                                  folder_path: str) -> Tuple[str, Dict[str, str]]:
+        """Generate thread.md content. Returns (markdown, signatures_dict)."""
         subjects = []
         participants = set()
         dates = []
@@ -973,10 +1001,7 @@ class OutlookPipeline:
                 lines.append(f'**Attachments**: {" | ".join(att_links)}')
                 lines.append('')
 
-        # Store signatures dict for separate file generation
-        self._thread_signatures = signatures
-
-        return '\n'.join(lines)
+        return '\n'.join(lines), signatures
 
     def _escape_yaml(self, value: str) -> str:
         """Escape a string for safe YAML embedding."""
@@ -1003,14 +1028,6 @@ class OutlookPipeline:
 
     def process_thread(self, thread_id: str, emails: List[Dict]) -> bool:
         """Process a single conversation thread (emails are snapshot dicts)."""
-        if not self.reprocess:
-            all_processed = all(
-                self._is_processed(snap['entry_id']) for snap in emails
-            )
-            if all_processed:
-                logger.debug(f"Thread already fully processed, skipping")
-                return True
-
         subject = emails[-1]['subject'] or 'No Subject'
         dir_name = self._thread_dir_name(subject)
         thread_dir = self.output_dir / dir_name
@@ -1030,7 +1047,7 @@ class OutlookPipeline:
 
                 unique_atts = []
                 for att in atts:
-                    key = (att['filename'], f"{att['size_mb']:.2f}")
+                    key = (att['filename'], att['size_bytes'])
                     if key not in seen_attachments:
                         seen_attachments.add(key)
                         unique_atts.append(att)
@@ -1054,17 +1071,16 @@ class OutlookPipeline:
                             att['output'] = output
 
         # Phase 3: Generate thread markdown (uses only snapshot data)
-        self._thread_signatures = {}
-        thread_md = self._generate_thread_markdown(
+        thread_md, signatures = self._generate_thread_markdown(
             thread_id, emails, all_attachments, self.folder_path
         )
         thread_path = thread_dir / "thread.md"
         thread_path.write_text(thread_md, encoding='utf-8')
 
         # Generate signatures.md if any signatures were detected
-        if self._thread_signatures:
+        if signatures:
             sig_lines = ['---', 'title: "Participant Signatures"', '---', '', '# Signatures', '']
-            for person, sig_text in self._thread_signatures.items():
+            for person, sig_text in signatures.items():
                 sig_lines.append(f'## {person}')
                 sig_lines.append('')
                 sig_lines.append(sig_text)
@@ -1132,6 +1148,13 @@ class OutlookPipeline:
                 shutil.rmtree(self._staging_dir, ignore_errors=True)
         except Exception:
             pass
+
+        # Release COM apartment
+        if getattr(self, '_pythoncom', None):
+            try:
+                self._pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
         logger.info(f"\n{'=' * 70}")
         logger.info(f"PIPELINE COMPLETE: {success_count} processed, "
