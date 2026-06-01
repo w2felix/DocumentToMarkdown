@@ -7,6 +7,9 @@ openpyxl>=3.1.0  # For Excel file reading
 # PPTX extraction
 python-pptx>=0.6.21
 
+# DOCX text extraction (for Outlook attachment processing)
+python-docx>=0.8.11
+
 # PowerPoint COM automation for PPTX slide rendering (Windows only)
 pywin32>=306; sys_platform == "win32"
 

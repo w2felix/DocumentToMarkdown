@@ -16,6 +16,7 @@ Built for pharmaceutical research — handles conference posters, patent filings
 | **Patent** | Patent filing PDFs (WO/EP/US) | Claims, chemical structures, SMILES, executive summaries |
 | **Talk** | Slide-based presentation PDFs | Slide-by-slide extraction with narrative summaries |
 | **Presentation** | PPTX + PDF presentations | Native text extraction, per-slide image descriptions, action items, chemical structures |
+| **Outlook** | Outlook email folders | Threaded conversations with processed attachments |
 
 Each pipeline produces a self-contained `.md` file with YAML frontmatter, making the output easy to search, filter, and integrate into knowledge bases.
 
@@ -81,6 +82,15 @@ python presentation_pipeline.py --input "path/to/presentations" --no-vision
 python presentation_pipeline.py --single "path/to/file.pptx" --naming dated
 ```
 
+**Outlook Emails:**
+```bash
+python outlook_pipeline.py --folder "Inbox/CI Reports"
+# limit to recent emails, skip attachments:
+python outlook_pipeline.py --folder "Inbox" --limit 50 --no-attachments
+# reprocess everything:
+python outlook_pipeline.py --folder "Inbox/Projects" --no-skip
+```
+
 ## Common Flags
 
 All pipelines share a consistent CLI interface:
@@ -100,6 +110,7 @@ Each pipeline also has specialized flags — see the pipeline-specific documenta
 - [Patent Pipeline flags](README_Patents.md#command-line-interface) — `--no-vision`, `--claims-only`, `--budget`, `--ocr-engine`
 - [Talk Pipeline flags](README_Talks.md#command-line-interface) — `--metadata`
 - [Presentation Pipeline flags](README_Presentations.md#command-line-interface) — `--no-vision`
+- [Outlook Pipeline flags](README_Outlook.md#command-line-interface) — `--folder`, `--no-attachments`, `--limit`
 
 ## Output Structure
 
@@ -129,54 +140,67 @@ output_talks/
 output_presentations/
 ├── presentation_ru_onc_operations_update_darmstadt.md
 └── presentation_caris_discovery_non_con_apr.md
+
+output_outlook/
+├── processed_state.json
+├── processing_log.tsv
+├── thread_project_alpha_update/
+│   ├── thread.md
+│   └── attachment_report.md
+└── thread_meeting_notes_q2/
+    └── thread.md
 ```
 
 ## Pipeline Comparison
 
 ### At a Glance
 
-| | Poster | Patent | Talk | Presentation |
-|---|--------|--------|------|--------------|
-| **Input** | Single-page poster PDF | Multi-page patent PDF (50–300+ pages) | Multi-slide presentation PDF (screenshots) | PPTX or PDF slide decks |
-| **Output** | Sections (Methods, Results, Conclusions) | Patent sections + claims + chemical data | Slide-by-slide content + narrative summary | Slide content + action items + metrics |
-| **Text extraction** | Native PDF + OCR + Vision AI | Native PDF + Tesseract OCR (scanned) + selective Vision AI for garbled pages | OCR + Vision AI only (no extractable text) | Native PPTX (python-pptx) or PyMuPDF + pdfplumber tables + Vision AI fallback |
-| **Metadata source** | Excel spreadsheet (optional) | Extracted from the PDF itself | Excel spreadsheet (optional) | Extracted from the file itself |
-| **Quality gate** | Yes — skips FAIR/POOR | No — all patents saved | No — all talks saved | No — all presentations saved |
+| | Poster | Patent | Talk | Presentation | Outlook |
+|---|--------|--------|------|--------------|---------|
+| **Input** | Single-page poster PDF | Multi-page patent PDF (50–300+ pages) | Multi-slide presentation PDF (screenshots) | PPTX or PDF slide decks | Outlook email folder |
+| **Output** | Sections (Methods, Results, Conclusions) | Patent sections + claims + chemical data | Slide-by-slide content + narrative summary | Slide content + action items + metrics | Threaded conversations + processed attachments |
+| **Text extraction** | Native PDF + OCR + Vision AI | Native PDF + Tesseract OCR (scanned) + selective Vision AI for garbled pages | OCR + Vision AI only (no extractable text) | Native PPTX (python-pptx) or PyMuPDF + pdfplumber tables + Vision AI fallback | Outlook COM (plain text / HTML conversion) |
+| **Metadata source** | Excel spreadsheet (optional) | Extracted from the PDF itself | Excel spreadsheet (optional) | Extracted from the file itself | Extracted from email headers |
+| **Quality gate** | Yes — skips FAIR/POOR | No — all patents saved | No — all talks saved | No — all presentations saved | No — all threads saved |
 
 ### Performance & Cost
 
-| | Poster | Patent | Talk | Presentation |
-|---|--------|--------|------|--------------|
-| **Processing time** | 1.5–4 min | 2–3 min (text+vision), 3–5 min (scanned+Tesseract), ~15s text-only | 1.5–4 min | <1s text-only, 30–90s with vision, 2–4 min image-heavy |
-| **API calls per doc** | 4 + N figures | 10–48 (text-native), 8–35 (scanned+Tesseract) | 4–9 (scales with slide count) | 1–3 (smart gating) + 5–15 (image enrichment), 0 text-only |
-| **Token usage per doc** | ~30K–60K | ~40K–120K | ~18K–35K | ~8K–20K (text-only), ~50K–120K (image-heavy) |
-| **Vision AI pages** | All pages (mandatory) | ~10% of pages (selective) | All slides (mandatory) | Smart gating: global analysis + per-slide image enrichment (requires PowerPoint for PPTX) |
-| **Text-only mode** | No | Yes (`--no-vision`) | No | Yes (`--no-vision`) |
-| **Claims-only mode** | No | Yes (`--claims-only`, ~5s) | No | No |
-| **Concurrency** | Up to 5 figure workers | Up to 3 batch workers | Up to 5 batch workers | Sequential |
+| | Poster | Patent | Talk | Presentation | Outlook |
+|---|--------|--------|------|--------------|---------|
+| **Processing time** | 1.5–4 min | 2–3 min (text+vision), 3–5 min (scanned+Tesseract), ~15s text-only | 1.5–4 min | <1s text-only, 30–90s with vision, 2–4 min image-heavy | ~1s per email (text only), +pipeline time for attachments |
+| **API calls per doc** | 4 + N figures | 10–48 (text-native), 8–35 (scanned+Tesseract) | 4–9 (scales with slide count) | 1–3 (smart gating) + 5–15 (image enrichment), 0 text-only | 0 (email body), varies for attachments |
+| **Token usage per doc** | ~30K–60K | ~40K–120K | ~18K–35K | ~8K–20K (text-only), ~50K–120K (image-heavy) | 0 (email body), varies for attachments |
+| **Vision AI pages** | All pages (mandatory) | ~10% of pages (selective) | All slides (mandatory) | Smart gating: global analysis + per-slide image enrichment (requires PowerPoint for PPTX) | None (attachments only) |
+| **Text-only mode** | No | Yes (`--no-vision`) | No | Yes (`--no-vision`) | Yes (default for email body) |
+| **Claims-only mode** | No | Yes (`--claims-only`, ~5s) | No | No | No |
+| **Concurrency** | Up to 5 figure workers | Up to 3 batch workers | Up to 5 batch workers | Sequential | Sequential |
 
 ### Unique Capabilities
 
-| Capability | Poster | Patent | Talk | Presentation |
-|------------|:------:|:------:|:----:|:------------:|
-| Two-stage figure analysis | x | | | |
-| Chemical structure extraction (SMILES) | | x | | x |
-| Claims dependency tree | | x | | |
-| Semantic classification (target, mechanism, modality) | | x | | |
-| Hybrid OCR (Tesseract + Vision AI) | | x | | |
-| Text quality scoring & auto-repair | | x | | |
-| OCR pre-pass as RAG context | x | | x | |
-| Abstract matching from metadata | x | | x | |
-| Native PPTX text extraction | | | | x |
-| Per-slide image enrichment (auto-describes figures/screenshots) | | | | x |
-| Smart Vision AI gating (skip when not needed) | | | | x |
-| Language detection (EN/DE) + English output | | | | x |
-| Classification detection (3-signal) | | | | x |
-| Action items & metrics extraction | | | | x |
-| Conditional summary (content-type aware) | | | | x |
-| Standardized naming schemes | x | x | | x |
-| Executive summary | x | x | x | x |
-| Quality scoring | x | x | x | x |
+| Capability | Poster | Patent | Talk | Presentation | Outlook |
+|------------|:------:|:------:|:----:|:------------:|:-------:|
+| Two-stage figure analysis | x | | | | |
+| Chemical structure extraction (SMILES) | | x | | x | |
+| Claims dependency tree | | x | | | |
+| Semantic classification (target, mechanism, modality) | | x | | | |
+| Hybrid OCR (Tesseract + Vision AI) | | x | | | |
+| Text quality scoring & auto-repair | | x | | | |
+| OCR pre-pass as RAG context | x | | x | | |
+| Abstract matching from metadata | x | | x | | |
+| Native PPTX text extraction | | | | x | |
+| Per-slide image enrichment (auto-describes figures/screenshots) | | | | x | |
+| Smart Vision AI gating (skip when not needed) | | | | x | |
+| Language detection (EN/DE) + English output | | | | x | |
+| Classification detection (3-signal) | | | | x | |
+| Action items & metrics extraction | | | | x | |
+| Conditional summary (content-type aware) | | | | x | |
+| Conversation threading (ConversationID + subject) | | | | | x |
+| Incremental processing (EntryID state tracking) | | | | | x |
+| Attachment routing to sub-pipelines | | | | | x |
+| HTML-to-markdown email body conversion | | | | | x |
+| Standardized naming schemes | x | x | | x | |
+| Executive summary | x | x | x | x | |
+| Quality scoring | x | x | x | x | |
 
 ### When to Use Which
 
@@ -184,6 +208,7 @@ output_presentations/
 - **Patent** — multi-page patent filings (WIPO, EPO, USPTO) with claims, chemical structures, and experimental data
 - **Talk** — slide-based presentations captured as PDF screenshots (no extractable text)
 - **Presentation** — PPTX or PDF slide decks with native text (corporate meetings, scientific presentations, agendas); supports English and German content
+- **Outlook** — email conversations from any Outlook folder; automatically processes PDF/PPTX/DOCX/XLSX attachments through the appropriate pipeline
 
 ## How It Works
 
@@ -203,12 +228,15 @@ output_presentations/
 | [Patent Pipeline](README_Patents.md) | Deep dive — claims parsing, SMILES extraction, text quality repair, semantic classification |
 | [Talk Pipeline](README_Talks.md) | Deep dive — slide extraction, OCR pre-pass, summary generation, batch processing |
 | [Presentation Pipeline](README_Presentations.md) | Deep dive — PPTX/PDF extraction, classification detection, action items, naming schemes |
+| [Outlook Pipeline](README_Outlook.md) | Deep dive — email threading, incremental processing, attachment routing |
 
 ## Requirements
 
 - Python 3.11+ (via Conda)
 - Tesseract OCR (poster/talk/patent pipelines — required for poster/talk, optional for patent scanned PDFs)
 - python-pptx, PyMuPDF, pdfplumber (presentation pipeline)
+- python-docx (outlook pipeline — DOCX attachment extraction)
 - Microsoft PowerPoint (optional — enables Vision AI for PPTX slide rendering)
+- Microsoft Outlook (outlook pipeline — must be running; no OAuth/admin required)
 - Anthropic API access (Claude Sonnet 4.6)
-- Windows (uses Windows Registry for credential loading; adaptable to other OS)
+- Windows (uses Windows Registry for credential loading; Outlook COM requires Windows)

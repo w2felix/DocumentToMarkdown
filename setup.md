@@ -4,7 +4,7 @@
 
 # Setup Guide
 
-Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk, presentation).
+Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk, presentation, outlook).
 
 ---
 
@@ -64,6 +64,9 @@ conda install -c conda-forge tesseract pytesseract -y
 # Presentation pipeline (PPTX support)
 pip install python-pptx
 
+# Outlook pipeline (DOCX attachment extraction)
+pip install python-docx
+
 # Anthropic API (Claude Vision)
 pip install anthropic
 ```
@@ -71,7 +74,7 @@ pip install anthropic
 ### Verify Installation
 
 ```bash
-python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic, pptx; print('All packages OK')"
+python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic, pptx, docx; print('All packages OK')"
 
 tesseract --version
 # Should output: tesseract 5.x.x
@@ -131,6 +134,9 @@ python talk_pipeline.py --talks "path/to/talk_pdfs" --metadata "abstracts.xlsx"
 
 # Process presentations
 python presentation_pipeline.py --input "path/to/pptx_or_pdf_files"
+
+# Process Outlook emails (Outlook must be running)
+python outlook_pipeline.py --folder "Inbox/CI Reports"
 ```
 
 See the [README](README.md) for full CLI options, or the pipeline-specific guides for architecture details:
@@ -138,6 +144,7 @@ See the [README](README.md) for full CLI options, or the pipeline-specific guide
 - [Patent Pipeline](README_Patents.md)
 - [Talk Pipeline](README_Talks.md)
 - [Presentation Pipeline](README_Presentations.md)
+- [Outlook Pipeline](README_Outlook.md)
 
 ---
 
@@ -197,7 +204,7 @@ python scripts/setup_tessdata.py
 
 - [ ] Install Miniconda
 - [ ] Create `ds_env` environment (Python 3.11)
-- [ ] Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract, python-pptx
+- [ ] Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract, python-pptx, python-docx
 - [ ] Set `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` (or `ANTHROPIC_API_KEY`)
 - [ ] Restart terminal
 - [ ] Run a pipeline to verify everything works
@@ -214,5 +221,6 @@ python scripts/setup_tessdata.py
 | pandas | Metadata handling | `conda install pandas` |
 | openpyxl | Excel file support | `conda install openpyxl` |
 | python-pptx | PPTX text/table extraction | `pip install python-pptx` |
+| python-docx | DOCX text extraction (Outlook attachments) | `pip install python-docx` |
 | pytesseract | OCR interface (Tesseract) | `conda install -c conda-forge pytesseract` |
 | anthropic | Claude Vision API client | `pip install anthropic` |
