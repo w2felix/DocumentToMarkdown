@@ -16,7 +16,9 @@ Built for pharmaceutical research — handles conference posters, patent filings
 | **Patent** | Patent filing PDFs (WO/EP/US) | Claims, chemical structures, SMILES, executive summaries |
 | **Talk** | Slide-based presentation PDFs | Slide-by-slide extraction with narrative summaries |
 | **Presentation** | PPTX + PDF presentations | Native text extraction, per-slide image descriptions, action items, chemical structures |
-| **Outlook** | Outlook email folders | Threaded conversations with processed attachments |
+| **Paper** | Scientific research paper PDFs | Full-text extraction with sections, figures, and summary |
+| **CI** | Competitive intelligence PDFs + PPTXs | Company/asset structured markdown, deal & regulatory event extraction |
+| **Outlook** | Outlook email folders | Threaded conversations, processed attachments, persistent contact book |
 
 Each pipeline produces a self-contained `.md` file with YAML frontmatter, making the output easy to search, filter, and integrate into knowledge bases.
 
@@ -82,6 +84,20 @@ python presentation_pipeline.py --input "path/to/presentations" --no-vision
 python presentation_pipeline.py --single "path/to/file.pptx" --naming dated
 ```
 
+**Papers:**
+```bash
+python paper_pipeline.py --input "path/to/papers"
+# single file:
+python paper_pipeline.py --single "path/to/paper.pdf"
+```
+
+**Competitive Intelligence:**
+```bash
+python ci_pipeline.py --input "path/to/ci_docs"
+# custom output location:
+python ci_pipeline.py --input "path/to/ci_docs" --output "output_ci"
+```
+
 **Outlook Emails:**
 ```bash
 python outlook_pipeline.py --folder "Inbox/CI Reports"
@@ -144,11 +160,16 @@ output_presentations/
 output_outlook/
 ├── processed_state.json
 ├── processing_log.tsv
-├── thread_project_alpha_update/
-│   ├── thread.md
-│   └── attachment_report.md
-└── thread_meeting_notes_q2/
-    └── thread.md
+├── people/                         # global contact book
+│   ├── carsten_schweer.yml
+│   └── alice_smith.yml
+└── Inbox/                          # mirrors Outlook folder hierarchy
+    └── CI Reports/
+        ├── thread_project_alpha_update/
+        │   ├── thread.md
+        │   └── attachment_report.md
+        └── thread_meeting_notes_q2/
+            └── thread.md
 ```
 
 ## Pipeline Comparison
@@ -234,9 +255,12 @@ output_outlook/
 
 - Python 3.11+ (via Conda)
 - Tesseract OCR (poster/talk/patent pipelines — required for poster/talk, optional for patent scanned PDFs)
-- python-pptx, PyMuPDF, pdfplumber (presentation pipeline)
+- python-pptx, PyMuPDF, pdfplumber (presentation/paper pipelines)
 - python-docx (outlook pipeline — DOCX attachment extraction)
+- pyyaml (outlook pipeline — contact book YAML read/write; usually pre-installed with conda)
 - Microsoft PowerPoint (optional — enables Vision AI for PPTX slide rendering)
 - Microsoft Outlook (outlook pipeline — must be running; no OAuth/admin required)
 - Anthropic API access (Claude Sonnet 4.6)
 - Windows (uses Windows Registry for credential loading; Outlook COM requires Windows)
+
+> **Note**: `paper_pipeline.py` and `ci_pipeline.py` do not yet have dedicated README files — see inline `--help` for their CLI options.

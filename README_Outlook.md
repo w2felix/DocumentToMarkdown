@@ -1,6 +1,8 @@
 # Outlook Email Processing Pipeline
 
-Ingests emails from a specified Outlook folder, groups them by conversation thread, and produces structured markdown. Attachments are extracted and routed to the appropriate pipeline (PDF, PPTX, DOCX, XLSX) for processing.
+← [Back to main README](README.md)
+
+Ingests emails from a specified Outlook folder, groups them by conversation thread, and produces structured markdown. Attachments are extracted and routed to the appropriate pipeline (PDF, PPTX, DOCX, XLSX) for processing. Detected email signatures are parsed into a persistent, change-tracked contact book (`people/`).
 
 **No OAuth or admin rights required** — uses `win32com` to communicate with the locally running Outlook desktop app.
 
@@ -53,16 +55,15 @@ See [setup.md](setup.md) for complete installation instructions.
 
 **Prerequisites:**
 - Miniconda (Python 3.11)
-- Required packages: `pywin32`, `python-docx`, `pandas`, `openpyxl`
+- Required packages: `pywin32`, `python-docx`, `pandas`, `openpyxl`, `pyyaml`
 - Microsoft Outlook (desktop app, running and logged in)
-
-**Additional package for DOCX attachment extraction:**
 
 ```bash
 pip install python-docx
+pip install pyyaml   # for reading/writing contact YAML files in people/
 ```
 
-No API credentials are needed for the outlook pipeline itself (email body processing is pure text extraction). API credentials are only needed if attachments are routed to AI-powered pipelines (paper, presentation).
+**API credentials:** not needed for email body processing (pure text extraction). Required if attachments are routed to AI-powered sub-pipelines (paper, presentation). See [setup.md](setup.md) for credential setup.
 
 ---
 
@@ -115,12 +116,15 @@ Outlook COM ──► Retrieve emails ──► Group by thread ──► Check 
                     ▼
               New threads only
                     │
-        ┌───────────┼───────────────┐
-        ▼           ▼               ▼
-  Extract body  Extract atts   Generate thread.md
-        │           │
-        │      Route to pipelines
-        │           │
+        ┌───────────┼─────────────────────┐
+        ▼           ▼                     ▼
+  Extract body  Extract atts        Generate thread.md
+  (strip banner,    │               (strip signatures
+   quoted chains)   │                from body text)
+                Route to                  │
+                pipelines            Parse signatures
+                    │               ──► Update people/
+                    │
         └───────────┴──► Save state ──► Log
 ```
 
@@ -147,21 +151,49 @@ The pipeline maintains a JSON state file (`processed_state.json`) tracking every
 
 ### Directory Structure
 
+The output directory mirrors the Outlook folder hierarchy, so threads from different folders stay grouped and easy to navigate. The `people/` directory is global and shared across all folder runs.
+
 ```
 output_outlook/
-├── processed_state.json                    # Incremental state tracking
-├── processing_log.tsv                      # Run history
-├── thread_project_alpha_update/            # One subfolder per thread
-│   ├── thread.md                           # The conversation markdown
-│   ├── attachment_report.md                # Processed PDF (via paper pipeline)
-│   ├── attachment_slides.md                # Processed PPTX (via presentation pipeline)
-│   └── image001.png                        # Inline image (kept raw)
-├── thread_meeting_notes_q2/
-│   ├── thread.md
-│   ├── attachment_budget_overview.md       # Processed XLSX (tables)
-│   └── budget_overview.xlsx                # Original file preserved
-└── thread_newsletter_weekly/
-    └── thread.md
+├── processed_state.json                    # Incremental state tracking (shared)
+├── processing_log.tsv                      # Run history (shared)
+├── people/                                 # Global contact book (shared across folders)
+│   ├── carsten_schweer.yml                 # One YAML file per person
+│   ├── alice_smith.yml
+│   └── ...
+└── Posteingang/                            # Mirrors Outlook folder hierarchy
+    └── Trans. Projects/
+        └── CARIS JRC/
+            ├── thread_caris_fragen.../     # One subfolder per thread
+            │   └── thread.md
+            └── thread_jrc_17.../
+                ├── thread.md
+                ├── attachment_report.md    # Processed PDF (via paper pipeline)
+                └── slides.pptx             # Original file preserved
+
+# Another folder run populates its own branch:
+# output_outlook/Inbox/CI Reports/thread_.../
+```
+
+**Contact files** (`people/*.yml`) accumulate over time. Each re-run adds to existing contacts and appends change history when fields differ:
+
+```yaml
+name: Carsten Schweer
+email: carsten.schweer@merckgroup.com
+phone: "+49 6151 72 26695"
+mobile: "+4915114544754"
+title: Alliance Management
+department: Biopharma | Global Business Development and Alliance Management
+organization: Merck
+location: "Frankfurter Str. 250, 64293 Darmstadt, Germany"
+website: merckgroup.com
+first_seen: "2026-05-07"
+last_seen: "2026-06-01"
+changes:
+  - date: "2026-09-01"
+    field: title
+    old: Alliance Management
+    new: Senior Director Alliance Management
 ```
 
 ### Markdown Structure
@@ -212,6 +244,18 @@ processing_date: "2026-06-01"
 
 **Attachments**: [report.pdf](attachment_report.md) | [slides.pptx](attachment_slides.md)
 ```
+
+---
+
+## Body Cleaning
+
+Before the email body is written to `thread.md`, several cleanup passes run automatically:
+
+| Pass | What it removes |
+|------|-----------------|
+| **Security banners** | Proofpoint/Merck injected `[EXTERNAL]` warning blocks (`ZjQcmQRYFpfpt*` markers) |
+| **Quoted chains** | `From: … Sent: … To: …` reply-history blocks that repeat earlier emails |
+| **Signatures** | Everything from the sign-off phrase onwards is stripped from the body and parsed into `people/` instead |
 
 ---
 

@@ -4,7 +4,7 @@
 
 # Setup Guide
 
-Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk, presentation, outlook).
+Complete installation instructions for the DocumentToMarkdown pipelines (poster, patent, talk, presentation, paper, CI, outlook).
 
 ---
 
@@ -64,8 +64,9 @@ conda install -c conda-forge tesseract pytesseract -y
 # Presentation pipeline (PPTX support)
 pip install python-pptx
 
-# Outlook pipeline (DOCX attachment extraction)
+# Outlook pipeline (DOCX attachment extraction + contact YAML files)
 pip install python-docx
+pip install pyyaml
 
 # Anthropic API (Claude Vision)
 pip install anthropic
@@ -74,7 +75,7 @@ pip install anthropic
 ### Verify Installation
 
 ```bash
-python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic, pptx, docx; print('All packages OK')"
+python -c "import pdfplumber, fitz, pandas, openpyxl, anthropic, pptx, docx, yaml; print('All packages OK')"
 
 tesseract --version
 # Should output: tesseract 5.x.x
@@ -134,6 +135,12 @@ python talk_pipeline.py --talks "path/to/talk_pdfs" --metadata "abstracts.xlsx"
 
 # Process presentations
 python presentation_pipeline.py --input "path/to/pptx_or_pdf_files"
+
+# Process scientific papers
+python paper_pipeline.py --input "path/to/papers"
+
+# Process competitive intelligence documents
+python ci_pipeline.py --input "path/to/ci_docs"
 
 # Process Outlook emails (Outlook must be running)
 python outlook_pipeline.py --folder "Inbox/CI Reports"
@@ -204,7 +211,7 @@ python scripts/setup_tessdata.py
 
 - [ ] Install Miniconda
 - [ ] Create `ds_env` environment (Python 3.11)
-- [ ] Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract, python-pptx, python-docx
+- [ ] Install pdfplumber, pymupdf, pandas, openpyxl, anthropic, pytesseract, python-pptx, python-docx, pyyaml
 - [ ] Set `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` (or `ANTHROPIC_API_KEY`)
 - [ ] Restart terminal
 - [ ] Run a pipeline to verify everything works
@@ -222,5 +229,6 @@ python scripts/setup_tessdata.py
 | openpyxl | Excel file support | `conda install openpyxl` |
 | python-pptx | PPTX text/table extraction | `pip install python-pptx` |
 | python-docx | DOCX text extraction (Outlook attachments) | `pip install python-docx` |
+| pyyaml | YAML read/write for Outlook contact files | `pip install pyyaml` |
 | pytesseract | OCR interface (Tesseract) | `conda install -c conda-forge pytesseract` |
 | anthropic | Claude Vision API client | `pip install anthropic` |

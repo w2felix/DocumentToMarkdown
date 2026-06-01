@@ -143,10 +143,19 @@ class OutlookPipeline:
                 parent = folder.Parent
                 folder = parent.Folders[parts[0]]
                 parts = parts[1:]
-            except Exception:
-                folder = namespace.GetDefaultFolder(self.OL_FOLDER_INBOX)
-                # If first part is something like "Inbox" in another language, try subfolders
-                pass
+            except Exception as e:
+                available = []
+                try:
+                    parent = namespace.GetDefaultFolder(self.OL_FOLDER_INBOX).Parent
+                    available = [parent.Folders.Item(i + 1).Name
+                                 for i in range(parent.Folders.Count)]
+                except Exception:
+                    pass
+                raise ValueError(
+                    f"Top-level folder '{parts[0]}' not found. "
+                    f"Available accounts/stores: {available}. "
+                    f"Use 'Inbox' or 'Posteingang' to start from your default inbox."
+                ) from e
 
         for part in parts:
             try:
@@ -431,7 +440,6 @@ class OutlookPipeline:
                 skip_line_count += 1
                 if skip_line_count > self.MEETING_INVITE_MAX_LINES:
                     skip = False
-                    result.append(line)
                 continue
             result.append(line)
         return '\n'.join(result)
@@ -841,8 +849,11 @@ class OutlookPipeline:
         """Process a multi-page PDF through the paper pipeline."""
         try:
             from paper_pipeline import PaperPipeline
+            # Use the file's own parent as input_folder so the pipeline only
+            # sees this one PDF and doesn't scan the whole thread directory
+            # (which already contains processed .md files).
             pipeline = PaperPipeline(
-                input_folder=str(thread_dir),
+                input_folder=str(file_path.parent),
                 output_dir=str(thread_dir),
             )
             pipeline.process_single_paper(file_path, skip_existing=False)
