@@ -1148,21 +1148,64 @@ class OutlookPipeline:
             existing['changes'] = []
         else:
             existing.setdefault('changes', [])
-            existing['last_seen'] = date
+            first_seen = existing.get('first_seen', date)
+            last_seen = existing.get('last_seen', date)
+
+            # Always widen the observed date range.
+            if date < first_seen:
+                existing['first_seen'] = date
+            if date > last_seen:
+                existing['last_seen'] = date
+
+            is_newer = date >= last_seen  # observation is at or after the latest known date
+
             for field in self._TRACKED_CONTACT_FIELDS:
                 new_val = (contact.get(field) or '').strip()
-                old_val = (existing.get(field) or '').strip()
-                if new_val and new_val != old_val:
-                    if old_val:
-                        existing['changes'].append({
-                            'date': date,
-                            'field': field,
-                            'old': old_val,
-                            'new': new_val,
-                        })
+                cur_val = (existing.get(field) or '').strip()
+
+                if not new_val or new_val == cur_val:
+                    continue
+
+                if is_newer:
+                    # Newer (or same-date) observation — update the current field
+                    # value and log the forward transition.
+                    if cur_val:
+                        self._insert_change(existing['changes'], date, field, cur_val, new_val)
                     existing[field] = new_val
+                else:
+                    # Older observation — the current value is still correct.
+                    # Record that on this earlier date the field held a different value,
+                    # and that it subsequently transitioned to the current value by
+                    # last_seen (or the first later date already in the change log).
+                    transition_date = self._first_change_date_for(
+                        existing['changes'], field, after=date) or last_seen
+                    self._insert_change(existing['changes'], date, field, '', new_val)
+                    if cur_val:
+                        self._insert_change(
+                            existing['changes'], transition_date, field, new_val, cur_val)
 
         self._save_contact(path, existing)
+
+    @staticmethod
+    def _insert_change(changes: list, date: str, field: str, old: str, new: str):
+        """Insert a change entry in chronological order, skipping exact duplicates."""
+        for ch in changes:
+            if ch['date'] == date and ch['field'] == field and ch.get('new') == new:
+                return
+        entry = {'date': date, 'field': field, 'old': old, 'new': new}
+        for i, ch in enumerate(changes):
+            if ch['date'] > date:
+                changes.insert(i, entry)
+                return
+        changes.append(entry)
+
+    @staticmethod
+    def _first_change_date_for(changes: list, field: str, after: str) -> Optional[str]:
+        """Return the earliest date in the change log for `field` that is after `after`."""
+        for ch in sorted(changes, key=lambda c: c['date']):
+            if ch['field'] == field and ch['date'] > after:
+                return ch['date']
+        return None
 
     # ─── Markdown Generation ────────────────────────────────────────────
 
