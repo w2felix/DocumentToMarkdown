@@ -658,7 +658,10 @@ class OutlookPipeline:
         """Route an attachment to the appropriate pipeline for processing."""
         file_path = att_info['path']
         att_type = att_info['type']
-        output_name = f"attachment_{file_path.stem}.md"
+        # Truncate stem so full path stays under Windows MAX_PATH (260)
+        max_stem = max(10, 260 - len(str(thread_dir)) - len('/attachment_.md'))
+        stem = sanitize_filename(file_path.stem)[:max_stem]
+        output_name = f"attachment_{stem}.md"
         output_path = thread_dir / output_name
 
         try:
@@ -878,10 +881,14 @@ class OutlookPipeline:
     # ─── Markdown Generation ────────────────────────────────────────────
 
     def _thread_dir_name(self, subject: str) -> str:
-        """Generate a directory name for a thread."""
+        """Generate a directory name for a thread, respecting Windows MAX_PATH."""
         normalized = self._normalize_subject(subject)
-        slug = re.sub(r'[^a-z0-9]+', '_', normalized)
-        slug = slug.strip('_')[:80]
+        slug = re.sub(r'[^a-z0-9]+', '_', normalized).strip('_')
+        # Reserve: output_dir + separator + "thread_" prefix + filename inside ("signatures.md" = 13)
+        max_path = 260
+        reserved = len(str(self.output_dir)) + 1 + len('thread_') + 1 + 13
+        max_slug = max(10, max_path - reserved)
+        slug = slug[:max_slug]
         if not slug:
             slug = 'unnamed_thread'
         return f"thread_{slug}"

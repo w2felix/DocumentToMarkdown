@@ -671,7 +671,7 @@ class PresentationPipeline:
                 scale = self.MAX_IMAGE_DIMENSION / max(width, height)
                 image = image.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
 
-            if image.mode == 'RGBA':
+            if image.mode not in ('RGB', 'L'):
                 image = image.convert('RGB')
 
             buffered = BytesIO()
