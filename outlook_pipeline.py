@@ -955,8 +955,11 @@ class OutlookPipeline:
 
             if sig:
                 sig_key = self._identify_signature_owner(sig, sender_name)
-                if sig_key not in signatures:
-                    signatures[sig_key] = self._strip_signoff_from_signature(sig)
+                clean_sig = self._strip_signoff_from_signature(sig)
+                if clean_sig and sig_key not in signatures:
+                    # Deduplicate by content — skip if same text already stored
+                    if clean_sig not in signatures.values():
+                        signatures[sig_key] = clean_sig
 
             entry_id = snap['entry_id']
             if entry_id in all_attachments and all_attachments[entry_id]:
