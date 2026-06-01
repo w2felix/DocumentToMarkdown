@@ -30,6 +30,8 @@ output_papers/
 output_patents/
 output_talks/
 output_presentations/
+output_outlook/
+output_ci/
 test_output_*/
 test_paper_output/
 figures/

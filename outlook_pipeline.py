@@ -14,7 +14,7 @@ import html
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from datetime import datetime
 from collections import defaultdict
 
@@ -66,6 +66,13 @@ class OutlookPipeline:
 
     INLINE_IMAGE_MAX_KB = 15
 
+    @staticmethod
+    def _folder_to_relative_path(folder_path: str) -> Path:
+        """Convert an Outlook folder path to a sanitized relative filesystem path."""
+        parts = re.split(r'[/\\]', folder_path.strip().strip('/\\'))
+        safe_parts = [re.sub(r'[<>:"/\\|?*]', '_', p).strip() for p in parts if p.strip()]
+        return Path(*safe_parts) if safe_parts else Path('.')
+
     def __init__(self, folder_path: str, output_dir: str, verbose: bool = False,
                  no_attachments: bool = False, reprocess: bool = False, limit: int = 0):
         self.folder_path = folder_path
@@ -75,6 +82,15 @@ class OutlookPipeline:
         self.no_attachments = no_attachments
         self.reprocess = reprocess
         self.limit = limit
+
+        # Mirror the Outlook folder hierarchy under output_dir so threads from
+        # different folders are kept separate and easy to navigate.
+        self._thread_base_dir = self.output_dir / self._folder_to_relative_path(folder_path)
+        self._thread_base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Global contact book — shared across all folder runs.
+        self._people_dir = self.output_dir / "people"
+        self._people_dir.mkdir(parents=True, exist_ok=True)
 
         self._staging_dir = self.output_dir / ".staging"
         self._staging_dir.mkdir(parents=True, exist_ok=True)
@@ -378,14 +394,19 @@ class OutlookPipeline:
 
         # Try common sign-off phrases
         match = self.SIGNATURE_START_RE.search(body)
-        if match and match.start() > len(body) * 0.3:
+        if match:
             content = body[:match.start()].rstrip()
-            sig = body[match.start():].strip()
-            if sig and len(sig) > 10:
-                sig = self._clean_signature(sig)
-                if sig:
-                    return content, sig
-                return content, None
+            # Require at least some real content before the sign-off.
+            # A percentage of total body length fails for short emails with long
+            # signatures — the signature inflates the denominator, pushing the
+            # threshold beyond the actual match position.
+            if content.strip() and match.start() > 10:
+                sig = body[match.start():].strip()
+                if sig and len(sig) > 10:
+                    sig = self._clean_signature(sig)
+                    if sig:
+                        return content, sig
+                    return content, None
 
         return body, None
 
@@ -536,14 +557,30 @@ class OutlookPipeline:
                 start = i + 1
                 found_signoff = True
                 continue
-            # Single first-name line shortly after greeting
-            if found_signoff and len(stripped.split()) == 1 and stripped[0].isupper() and len(stripped) < 20:
+            # First name or full name line immediately after the greeting
+            # (e.g., "Carsten" or "Carsten Schweer") — skip it; the full name is
+            # already known from sender_name and will be re-captured by the parser.
+            if found_signoff and stripped[0].isupper() and len(stripped) < 50 and \
+                    not any(c in stripped for c in ('@', '+', '|', '.')):
                 start = i + 1
                 continue
             break
         return '\n'.join(lines[start:]).strip()
 
     # ─── Body Extraction ────────────────────────────────────────────────
+
+    # Matches Proofpoint/Merck injected banner blocks and their tracking tokens.
+    _BANNER_BLOCK_RE = re.compile(
+        r'ZjQcmQRYFpfptBannerStart.*?ZjQcmQRYFpfptBannerEnd',
+        re.DOTALL
+    )
+    _BANNER_TOKEN_RE = re.compile(r'^ZjQcmQRYFpfpt\S*\s*$', re.MULTILINE)
+
+    def _strip_security_banners(self, text: str) -> str:
+        """Remove injected security/phishing-warning banners (Proofpoint/Merck style)."""
+        text = self._BANNER_BLOCK_RE.sub('', text)
+        text = self._BANNER_TOKEN_RE.sub('', text)
+        return text
 
     def _extract_body(self, snap: Dict) -> str:
         """Extract email body from snapshot as plain text or converted markdown."""
@@ -553,6 +590,9 @@ class OutlookPipeline:
             text = self._html_to_text(snap['html_body'])
         else:
             return "[Empty email body]"
+
+        # Strip injected security banners before anything else
+        text = self._strip_security_banners(text)
 
         # Strip quoted email chains from body
         text = self._strip_quoted_emails(text)
@@ -878,15 +918,235 @@ class OutlookPipeline:
             logger.warning(f"Excel extraction failed for {file_path.name}: {e}")
             return None
 
+    # ─── People Directory ───────────────────────────────────────────────
+
+    # Regex patterns for extracting labeled contact fields from signature lines.
+    _CTX_PHONE_RE  = re.compile(r'(?:Phone|Tel(?:efon)?|T)\s*[:\|]\s*([+\d][\d\s\-\(\)\.]{4,})', re.IGNORECASE)
+    _CTX_MOBILE_RE = re.compile(r'(?:Mobile|Cell(?:ular)?|Mobil|Mob|M)\s*[:\|]\s*([+\d][\d\s\-\(\)\.]{4,})', re.IGNORECASE)
+    _CTX_FAX_RE    = re.compile(r'Fax\s*[:\|]\s*([+\d][\d\s\-\(\)\.]{4,})', re.IGNORECASE)
+    _CTX_EMAIL_RE  = re.compile(r'E-?mail\s*[:\|]\s*([\w.+\-]+@[\w.\-]+\.\w{2,})', re.IGNORECASE)
+    _CTX_WEB_RE    = re.compile(r'(?:www\.)[\w.\-/]+|https?://[\w.\-/]+', re.IGNORECASE)
+    _CTX_ADDR_RE   = re.compile(
+        r'\b\d{4,5}\b'
+        r'|\b(?:Germany|Deutschland|USA|UK|France|Switzerland|Austria|'
+        r'Spain|Netherlands|Belgium|Sweden|Denmark|Norway|Italy|Japan|China|India)\b',
+        re.IGNORECASE
+    )
+
+    # Fields whose changes are tracked in the history.
+    _TRACKED_CONTACT_FIELDS = ('title', 'department', 'organization', 'location',
+                               'email', 'phone', 'mobile')
+
+    def _parse_signature_to_contact(self, sig: str, sender_name: str,
+                                    sender_email: str) -> Dict:
+        """Parse a cleaned signature block into a structured contact dict."""
+        contact: Dict[str, str] = {}
+        if sender_name:
+            contact['name'] = sender_name
+        if sender_email and not sender_email.startswith('/'):
+            contact['email'] = sender_email
+
+        lines = [l.strip() for l in sig.split('\n') if l.strip()]
+        structural: List[str] = []
+
+        for line in lines:
+            # Skip sign-off greetings
+            if self._SIGNOFF_RE.match(line):
+                continue
+            # Skip decoration / single/double-char lines
+            if len(line) <= 2 or re.match(r'^[\-_=|*#]{2,}$', line):
+                continue
+            # Skip motto/tagline lines (4+ words with em-dash or hyphen separator)
+            if re.search(r'\s[-–]\s', line) and len(line.split()) >= 4:
+                continue
+
+            # Try labeled fields on pipe-split segments (Phone | Mobile | Email on one line)
+            segments = re.split(r'\s*\|\s*', line)
+            consumed: List[bool] = [False] * len(segments)
+            for i, seg in enumerate(segments):
+                for field, pat in [('phone',  self._CTX_PHONE_RE),
+                                   ('mobile', self._CTX_MOBILE_RE),
+                                   ('fax',    self._CTX_FAX_RE),
+                                   ('email',  self._CTX_EMAIL_RE)]:
+                    m = pat.match(seg.strip())
+                    if m:
+                        if field not in contact:
+                            contact[field] = m.group(1).strip()
+                        consumed[i] = True
+                        break
+
+            leftover = [s for s, c in zip(segments, consumed) if not c]
+            if all(consumed):
+                continue
+            if any(consumed):
+                # Reassemble only the unconsumed segments for further processing
+                line = ' | '.join(leftover)
+
+            # Standalone bare email address
+            if re.match(r'^[\w.+\-]+@[\w.\-]+\.\w{2,}$', line):
+                if 'email' not in contact:
+                    contact['email'] = line
+                continue
+
+            # Website (only when the line is just a URL)
+            m = self._CTX_WEB_RE.search(line)
+            if m and len(line.split()) <= 3 and 'website' not in contact:
+                url = re.sub(r'^https?://', '', m.group(0)).rstrip('/')
+                contact['website'] = url
+                continue
+
+            # Skip lone first-name line (matches sender's given name)
+            given = (sender_name or '').split()[0] if sender_name else ''
+            if given and line == given:
+                continue
+            # Skip duplicate full-name line
+            if sender_name and line == sender_name:
+                continue
+
+            structural.append(line)
+
+        # Map remaining structural lines to name/title/department/organization/location
+        for line in structural:
+            # Location: has postcode or country
+            if self._CTX_ADDR_RE.search(line) and 'location' not in contact:
+                loc = re.sub(r'\bPostcode\s*[:\|]\s*\S+\s*', '', line, flags=re.IGNORECASE)
+                loc = re.sub(r'\s*\|\s*', ', ', loc).strip().strip(',').strip()
+                contact['location'] = loc
+                continue
+
+            # Pipe-separated line starting with a short company name: "Merck | Street..."
+            if '|' in line:
+                parts = [p.strip() for p in line.split('|')]
+                first = parts[0]
+                if (len(first) < 40 and
+                        re.match(r'^[A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s\.\-&]+$', first) and
+                        'organization' not in contact):
+                    contact['organization'] = first
+                    addr_parts = [p for p in parts[1:]
+                                  if p and not re.match(r'^Postcode', p, re.IGNORECASE)]
+                    if addr_parts and 'location' not in contact:
+                        contact['location'] = ', '.join(addr_parts)
+                elif 'department' not in contact:
+                    contact['department'] = line
+                continue
+
+            # Assign in order: title → department → organization
+            for field in ('title', 'department', 'organization'):
+                if field not in contact:
+                    contact[field] = line
+                    break
+
+        return {k: v for k, v in contact.items() if v}
+
+    def _person_slug(self, name: str) -> str:
+        """Convert a person's name to a filesystem-safe slug."""
+        slug = name.lower().strip()
+        slug = re.sub(r'^(?:dr|prof|mr|mrs|ms)\.?\s+', '', slug)
+        slug = re.sub(r'[^a-z0-9\s]', '', slug)
+        return re.sub(r'\s+', '_', slug).strip('_') or 'unknown'
+
+    def _load_contact(self, path: Path) -> Dict:
+        """Load a YAML contact file; returns {} on failure."""
+        try:
+            import yaml  # type: ignore
+            data = yaml.safe_load(path.read_text(encoding='utf-8'))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_contact(self, path: Path, contact: Dict):
+        """Write a contact dict as clean, human-readable YAML."""
+        def _q(v: str) -> str:
+            """Quote and escape a YAML string value when necessary."""
+            if not isinstance(v, str):
+                return str(v)
+            escaped = v.replace('\\', '\\\\').replace('"', '\\"')
+            needs_quotes = any(c in v for c in ':#@|,[]{}') or v.startswith(('+', '"', "'", '-'))
+            return f'"{escaped}"' if needs_quotes else v
+
+        lines: List[str] = []
+        for field in ('name', 'email', 'phone', 'mobile', 'fax',
+                      'title', 'department', 'organization', 'location', 'website',
+                      'first_seen', 'last_seen'):
+            if contact.get(field):
+                lines.append(f'{field}: {_q(str(contact[field]))}')
+
+        changes = contact.get('changes') or []
+        if changes:
+            lines.append('changes:')
+            for ch in changes:
+                lines.append(f'  - date: "{ch["date"]}"')
+                lines.append(f'    field: {ch["field"]}')
+                old = str(ch.get('old', ''))
+                new = str(ch.get('new', ''))
+                lines.append(f'    old: {_q(old)}')
+                lines.append(f'    new: {_q(new)}')
+        else:
+            lines.append('changes: []')
+
+        tmp = path.with_suffix('.yml.tmp')
+        tmp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        tmp.replace(path)
+
+    def _update_contact_file(self, contact: Dict, date: str):
+        """Create or update a YAML contact file, tracking field changes over time."""
+        if not contact.get('name') and not contact.get('email'):
+            return
+
+        slug = self._person_slug(contact.get('name', contact.get('email', 'unknown')))
+        incoming_name = (contact.get('name') or '').lower()
+
+        # Resolve slug collision: different people may produce the same slug
+        # (e.g., "Jan Muller" vs "Jan Müller"). Walk numeric suffixes until we
+        # find an existing file whose name matches, or a free slot.
+        base_slug = slug
+        n = 2
+        path = self._people_dir / f'{slug}.yml'
+        while path.exists():
+            existing_name = (self._load_contact(path).get('name') or '').lower()
+            if not existing_name or existing_name == incoming_name:
+                break
+            slug = f'{base_slug}_{n}'
+            path = self._people_dir / f'{slug}.yml'
+            n += 1
+
+        if path.exists():
+            existing = self._load_contact(path)
+        else:
+            existing = {}
+
+        if not existing:
+            existing = {k: v for k, v in contact.items()}
+            existing['first_seen'] = date
+            existing['last_seen'] = date
+            existing['changes'] = []
+        else:
+            existing.setdefault('changes', [])
+            existing['last_seen'] = date
+            for field in self._TRACKED_CONTACT_FIELDS:
+                new_val = (contact.get(field) or '').strip()
+                old_val = (existing.get(field) or '').strip()
+                if new_val and new_val != old_val:
+                    if old_val:
+                        existing['changes'].append({
+                            'date': date,
+                            'field': field,
+                            'old': old_val,
+                            'new': new_val,
+                        })
+                    existing[field] = new_val
+
+        self._save_contact(path, existing)
+
     # ─── Markdown Generation ────────────────────────────────────────────
 
     def _thread_dir_name(self, subject: str) -> str:
         """Generate a directory name for a thread, respecting Windows MAX_PATH."""
         normalized = self._normalize_subject(subject)
         slug = re.sub(r'[^a-z0-9]+', '_', normalized).strip('_')
-        # Reserve: output_dir + separator + "thread_" prefix + filename inside ("signatures.md" = 13)
+        # Reserve: thread_base_dir + separator + "thread_" prefix + longest filename inside ("thread.md" = 9)
         max_path = 260
-        reserved = len(str(self.output_dir)) + 1 + len('thread_') + 1 + 13
+        reserved = len(str(self._thread_base_dir)) + 1 + len('thread_') + 1 + 13
         max_slug = max(10, max_path - reserved)
         slug = slug[:max_slug]
         if not slug:
@@ -895,8 +1155,8 @@ class OutlookPipeline:
 
     def _generate_thread_markdown(self, thread_id: str, emails: List[Dict],
                                   all_attachments: Dict[str, List[Dict]],
-                                  folder_path: str) -> Tuple[str, Dict[str, str]]:
-        """Generate thread.md content. Returns (markdown, signatures_dict)."""
+                                  folder_path: str) -> Tuple[str, List[Tuple[Dict, str]]]:
+        """Generate thread.md content. Returns (markdown, contact_updates)."""
         subjects = []
         participants = set()
         dates = []
@@ -957,7 +1217,9 @@ class OutlookPipeline:
         )
         lines.append('')
 
-        signatures: Dict[str, str] = {}  # sender -> signature text
+        # contact_updates: list of (contact_dict, date_str) to persist to people dir
+        contact_updates: List[Tuple[Dict, str]] = []
+        seen_sigs: Set[str] = set()
 
         for idx, snap in enumerate(emails, 1):
             lines.append('---')
@@ -989,12 +1251,16 @@ class OutlookPipeline:
             lines.append('')
 
             if sig:
-                sig_key = self._identify_signature_owner(sig, sender_name)
                 clean_sig = self._strip_signoff_from_signature(sig)
-                if clean_sig and sig_key not in signatures:
-                    # Deduplicate by content — skip if same text already stored
-                    if clean_sig not in signatures.values():
-                        signatures[sig_key] = clean_sig
+                if clean_sig and clean_sig not in seen_sigs:
+                    seen_sigs.add(clean_sig)
+                    email_date = (snap['received'].strftime('%Y-%m-%d')
+                                  if snap['received'] else datetime.now().strftime('%Y-%m-%d'))
+                    contact = self._parse_signature_to_contact(
+                        clean_sig, sender_name, sender_email
+                    )
+                    if contact.get('name') or contact.get('email'):
+                        contact_updates.append((contact, email_date))
 
             entry_id = snap['entry_id']
             if entry_id in all_attachments and all_attachments[entry_id]:
@@ -1008,7 +1274,7 @@ class OutlookPipeline:
                 lines.append(f'**Attachments**: {" | ".join(att_links)}')
                 lines.append('')
 
-        return '\n'.join(lines), signatures
+        return '\n'.join(lines), contact_updates
 
     def _escape_yaml(self, value: str) -> str:
         """Escape a string for safe YAML embedding."""
@@ -1037,7 +1303,7 @@ class OutlookPipeline:
         """Process a single conversation thread (emails are snapshot dicts)."""
         subject = emails[-1]['subject'] or 'No Subject'
         dir_name = self._thread_dir_name(subject)
-        thread_dir = self.output_dir / dir_name
+        thread_dir = self._thread_base_dir / dir_name
         thread_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Processing thread: {subject} ({len(emails)} emails)")
@@ -1078,24 +1344,15 @@ class OutlookPipeline:
                             att['output'] = output
 
         # Phase 3: Generate thread markdown (uses only snapshot data)
-        thread_md, signatures = self._generate_thread_markdown(
+        thread_md, contact_updates = self._generate_thread_markdown(
             thread_id, emails, all_attachments, self.folder_path
         )
         thread_path = thread_dir / "thread.md"
         thread_path.write_text(thread_md, encoding='utf-8')
 
-        # Generate signatures.md if any signatures were detected
-        if signatures:
-            sig_lines = ['---', 'title: "Participant Signatures"', '---', '', '# Signatures', '']
-            for person, sig_text in signatures.items():
-                sig_lines.append(f'## {person}')
-                sig_lines.append('')
-                sig_lines.append(sig_text)
-                sig_lines.append('')
-                sig_lines.append('---')
-                sig_lines.append('')
-            sig_path = thread_dir / "signatures.md"
-            sig_path.write_text('\n'.join(sig_lines), encoding='utf-8')
+        # Phase 4: Update global people directory from detected signatures
+        for contact, date in contact_updates:
+            self._update_contact_file(contact, date)
 
         # Mark all emails as processed
         for snap in emails:
