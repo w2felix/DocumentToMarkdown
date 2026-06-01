@@ -673,18 +673,29 @@ class OutlookPipeline:
 
             dest_path = thread_dir / filename
             if dest_path.exists():
-                stem = dest_path.stem
-                suffix = dest_path.suffix
-                counter = 1
-                while dest_path.exists():
-                    dest_path = thread_dir / f"{stem}_{counter}{suffix}"
-                    counter += 1
-
-            try:
-                staged_path.rename(dest_path)
-            except OSError:
-                import shutil
-                shutil.move(str(staged_path), str(dest_path))
+                if dest_path.stat().st_size == size_bytes:
+                    # Same file already present from a previous run — reuse it,
+                    # discard the redundant staging copy.
+                    staged_path.unlink(missing_ok=True)
+                else:
+                    # Genuinely different file with the same name — give it a suffix.
+                    stem = dest_path.stem
+                    suffix = dest_path.suffix
+                    counter = 1
+                    while dest_path.exists():
+                        dest_path = thread_dir / f"{stem}_{counter}{suffix}"
+                        counter += 1
+                    try:
+                        staged_path.rename(dest_path)
+                    except OSError:
+                        import shutil
+                        shutil.move(str(staged_path), str(dest_path))
+            else:
+                try:
+                    staged_path.rename(dest_path)
+                except OSError:
+                    import shutil
+                    shutil.move(str(staged_path), str(dest_path))
 
             att_type = self.ATTACHMENT_PIPELINES.get(ext, 'raw')
             if ext in self.IMAGE_EXTENSIONS:
@@ -711,6 +722,10 @@ class OutlookPipeline:
         stem = sanitize_filename(file_path.stem)[:max_stem]
         output_name = f"attachment_{stem}.md"
         output_path = thread_dir / output_name
+
+        # Skip re-processing if the output already exists from a previous run.
+        if output_path.exists():
+            return output_name
 
         try:
             if att_type == 'paper':
