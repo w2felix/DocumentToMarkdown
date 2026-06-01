@@ -404,11 +404,34 @@ class OutlookPipeline:
                 result.append(line)
         return '\n'.join(result)
 
+    def _strip_quoted_emails(self, text: str) -> str:
+        """Remove quoted email chains (From: ... Sent: ... To: ... blocks) from text."""
+        quoted_header_re = re.compile(
+            r'^(?:From|Von|De|Sent|Gesendet|Envoy|To|An|Cc|Subject|Betreff|Objet)\s*:',
+            re.IGNORECASE
+        )
+        lines = text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if re.match(r'^(?:From|Von|De)\s*:', line, re.IGNORECASE):
+                header_count = 1
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    if quoted_header_re.match(lines[j]):
+                        header_count += 1
+                if header_count >= 3:
+                    return '\n'.join(lines[:i]).strip()
+            i += 1
+        return text
+
     def _clean_signature(self, sig: str) -> Optional[str]:
-        """Clean up a signature: remove meeting invites, mandatory notices, format nicely."""
+        """Clean up a signature: remove meeting invites, quoted emails, mandatory notices."""
         # If the whole thing is a meeting invite, discard
         if self.MEETING_INVITE_RE.search(sig[:200]):
             return None
+
+        # Strip quoted email chains
+        sig = self._strip_quoted_emails(sig)
 
         # Strip mandatory/privacy notices
         sig = self.MANDATORY_INFO_RE.sub('', sig)
@@ -505,9 +528,15 @@ class OutlookPipeline:
         else:
             return "[Empty email body]"
 
-        # Collapse excessive blank lines
+        # Strip quoted email chains from body
+        text = self._strip_quoted_emails(text)
+
+        # Strip whitespace-only lines and trailing whitespace per line
+        lines = text.split('\n')
+        lines = [line.rstrip() if line.strip() else '' for line in lines]
+        text = '\n'.join(lines)
+        # Collapse 3+ blank lines to one
         text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r'(\n[ \t]*){3,}', '\n\n', text)
         return text.strip()
 
     def _html_to_text(self, html_content: str) -> str:
