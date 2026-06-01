@@ -439,6 +439,61 @@ class OutlookPipeline:
 
         return sig.strip()
 
+    def _identify_signature_owner(self, sig: str, fallback_name: str) -> str:
+        """Extract the person's name from the signature content itself."""
+        lines = [l.strip() for l in sig.split('\n') if l.strip()]
+        # Skip sign-off line (Best regards, Thanks, etc.)
+        start = 0
+        for i, line in enumerate(lines):
+            if re.match(
+                r'^(?:Best regards|Kind regards|Regards|Thanks|Cheers|Sincerely|'
+                r'Mit freundlichen Gr[uü][sß]en|Viele Gr[uü][sß]e|MfG|VG|BR)',
+                line, re.IGNORECASE
+            ):
+                start = i + 1
+                continue
+            # Also skip single first-name lines right after greeting (e.g. "Carsten")
+            if i == start and len(line.split()) == 1 and line[0].isupper() and len(line) < 20:
+                start = i + 1
+                continue
+            break
+
+        # The name is typically the first non-empty line after the sign-off
+        for line in lines[start:]:
+            if (len(line) < 50 and
+                not any(x in line.lower() for x in ['|', 'phone:', 'e-mail:', 'www.', 'http', '@']) and
+                not line.startswith('+') and
+                not re.match(r'^[\d\s\-\(\)]+$', line)):
+                return line
+
+        return fallback_name
+
+    def _strip_signoff_from_signature(self, sig: str) -> str:
+        """Remove the greeting/sign-off lines from the beginning of a signature."""
+        lines = sig.split('\n')
+        start = 0
+        found_signoff = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                if found_signoff:
+                    start = i + 1
+                continue
+            if re.match(
+                r'^(?:Best regards|Kind regards|Regards|Thanks|Cheers|Sincerely|'
+                r'Mit freundlichen Gr[uü][sß]en|Viele Gr[uü][sß]e|MfG|VG|BR)[,]?\s*$',
+                stripped, re.IGNORECASE
+            ):
+                start = i + 1
+                found_signoff = True
+                continue
+            # Single first-name line shortly after greeting
+            if found_signoff and len(stripped.split()) == 1 and stripped[0].isupper() and len(stripped) < 20:
+                start = i + 1
+                continue
+            break
+        return '\n'.join(lines[start:]).strip()
+
     # ─── Body Extraction ────────────────────────────────────────────────
 
     def _extract_body(self, snap: Dict) -> str:
@@ -870,9 +925,9 @@ class OutlookPipeline:
             lines.append('')
 
             if sig:
-                sig_key = sender_name or sender_email or sender
+                sig_key = self._identify_signature_owner(sig, sender_name)
                 if sig_key not in signatures:
-                    signatures[sig_key] = sig
+                    signatures[sig_key] = self._strip_signoff_from_signature(sig)
 
             entry_id = snap['entry_id']
             if entry_id in all_attachments and all_attachments[entry_id]:
