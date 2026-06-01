@@ -11,8 +11,12 @@ import os
 import re
 import json
 import html
+import hashlib
+import shutil
+import tempfile
 import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
 from datetime import datetime
@@ -40,6 +44,9 @@ class OutlookPipeline:
     }
 
     IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.svg'}
+    # Outlook names embedded/inline images image001.png, image002[3].png, etc.
+    # These are always signature logos — never real content attachments.
+    OUTLOOK_EMBEDDED_IMAGE_RE = re.compile(r'^image\d+', re.IGNORECASE)
 
     SUBJECT_PREFIX_RE = re.compile(
         r'^(?:(?:Re|Fwd|FW|RE|AW|WG|Antwort|Weitergeleitet)\s*:\s*)+',
@@ -447,7 +454,7 @@ class OutlookPipeline:
     def _strip_quoted_emails(self, text: str) -> str:
         """Remove quoted email chains (From: ... Sent: ... To: ... blocks) from text."""
         quoted_header_re = re.compile(
-            r'^(?:From|Von|De|Sent|Gesendet|Envoy|To|An|Cc|Subject|Betreff|Objet)\s*:',
+            r'^(?:From|Von|De|Sent|Gesendet|Envoy|To|An|Cc|Subject|Betreff|Objet|When|Date)\s*:',
             re.IGNORECASE
         )
         lines = text.split('\n')
@@ -485,10 +492,7 @@ class OutlookPipeline:
         if m:
             sig = sig[:m.start()]
 
-        # Remove urldefense wrappers: [text](url) → text
-        sig = re.sub(r'\[([^\]]+)\]\(https?://urldefense[^)]+\)', r'\1', sig)
-        # Remove raw urldefense links
-        sig = re.sub(r'<https?://urldefense[^>]+>', '', sig)
+        sig = self._strip_urldefense_links(sig)
         # Clean markdown links with display text: [text](url) → text
         sig = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', sig)
         # Remove <mailto:...> and <http...> angle-bracket links
@@ -583,11 +587,24 @@ class OutlookPipeline:
         re.DOTALL
     )
     _BANNER_TOKEN_RE = re.compile(r'^ZjQcmQRYFpfpt\S*\s*$', re.MULTILINE)
+    # Catches preheader lines like "​͏​Hello All... ZjQcmQRYFpfptPreheaderEnd"
+    # where the start token was stripped but content + end token remain on one line.
+    _PREHEADER_LINE_RE = re.compile(r'^.*ZjQcmQRYFpfptPreheaderEnd.*$', re.MULTILINE)
 
     def _strip_security_banners(self, text: str) -> str:
         """Remove injected security/phishing-warning banners (Proofpoint/Merck style)."""
         text = self._BANNER_BLOCK_RE.sub('', text)
         text = self._BANNER_TOKEN_RE.sub('', text)
+        text = self._PREHEADER_LINE_RE.sub('', text)
+        return text
+
+    @staticmethod
+    def _strip_urldefense_links(text: str) -> str:
+        """Replace Proofpoint URL-Defense wrappers with their display text."""
+        # [display text](urldefense_url) → display text
+        text = re.sub(r'\[([^\]]+)\]\(https?://urldefense[^)]+\)', r'\1', text)
+        # <urldefense_url> → removed (raw angle-bracket link with no display text)
+        text = re.sub(r'<https?://urldefense[^>]+>', '', text)
         return text
 
     def _extract_body(self, snap: Dict) -> str:
@@ -601,6 +618,9 @@ class OutlookPipeline:
 
         # Strip injected security banners before anything else
         text = self._strip_security_banners(text)
+
+        # Strip Proofpoint URL-Defense wrappers
+        text = self._strip_urldefense_links(text)
 
         # Strip quoted email chains from body
         text = self._strip_quoted_emails(text)
@@ -656,8 +676,15 @@ class OutlookPipeline:
             if not staged_path.exists():
                 continue
 
-            # Skip tiny inline images (signature logos)
             ext = Path(filename).suffix.lower()
+            stem = Path(filename).stem
+
+            # Drop Outlook-embedded images (signature logos named image001[N].png etc.)
+            if ext in self.IMAGE_EXTENSIONS and self.OUTLOOK_EMBEDDED_IMAGE_RE.match(stem):
+                staged_path.unlink(missing_ok=True)
+                continue
+
+            # Drop any remaining tiny inline images
             size_kb = staged_path.stat().st_size / 1024
             if ext in self.IMAGE_EXTENSIONS and size_kb < self.INLINE_IMAGE_MAX_KB:
                 staged_path.unlink(missing_ok=True)
@@ -670,6 +697,12 @@ class OutlookPipeline:
                 logger.warning(f"Attachment too large ({size_mb:.1f}MB): {filename}")
                 staged_path.unlink(missing_ok=True)
                 continue
+
+            # Truncate filename so the full dest_path stays under Windows MAX_PATH (260).
+            _ext = Path(filename).suffix
+            _max_stem = max(10, 260 - len(str(thread_dir)) - 1 - len(_ext))
+            if len(Path(filename).stem) > _max_stem:
+                filename = Path(filename).stem[:_max_stem] + _ext
 
             dest_path = thread_dir / filename
             if dest_path.exists():
@@ -794,7 +827,7 @@ class OutlookPipeline:
             doc = fitz.open(str(file_path))
             images_b64 = []
             for page in doc:
-                pix = page.get_pixmap(dpi=150)
+                pix = page.get_pixmap(dpi=100)
                 img_bytes = pix.tobytes("png")
                 images_b64.append(base64.standard_b64encode(img_bytes).decode())
             doc.close()
@@ -843,36 +876,25 @@ class OutlookPipeline:
             logger.warning(f"Vision AI extraction failed for {file_path.name}: {e}")
             return self._process_pdf_as_paper(file_path, thread_dir, output_name)
 
-    def _rename_newest_md(self, thread_dir: Path, output_name: str,
-                          excluded: tuple = ('thread', 'signatures')) -> Optional[str]:
-        """Find the most recently modified .md file in thread_dir and rename it to output_name."""
-        candidates = [
-            f for f in thread_dir.glob('*.md')
-            if f.stem not in excluded and f.name != output_name
-        ]
-        if not candidates:
-            # Output was already named correctly
-            if (thread_dir / output_name).exists():
-                return output_name
-            return None
-        newest = max(candidates, key=lambda f: f.stat().st_mtime)
-        newest.rename(thread_dir / output_name)
-        return output_name
-
     def _process_pdf_as_paper(self, file_path: Path, thread_dir: Path,
                               output_name: str) -> Optional[str]:
         """Process a multi-page PDF through the paper pipeline."""
         try:
             from paper_pipeline import PaperPipeline
-            # Use the file's own parent as input_folder so the pipeline only
-            # sees this one PDF and doesn't scan the whole thread directory
-            # (which already contains processed .md files).
-            pipeline = PaperPipeline(
-                input_folder=str(file_path.parent),
-                output_dir=str(thread_dir),
-            )
-            pipeline.process_single_paper(file_path, skip_existing=False)
-            return self._rename_newest_md(thread_dir, output_name)
+            # Write output to an isolated scratch dir so concurrent calls don't
+            # race over the shared thread_dir when grabbing the newest .md file.
+            with tempfile.TemporaryDirectory(dir=thread_dir) as scratch:
+                scratch_path = Path(scratch)
+                pipeline = PaperPipeline(
+                    input_folder=str(file_path.parent),
+                    output_dir=str(scratch_path),
+                )
+                pipeline.process_single_paper(file_path, skip_existing=False)
+                mds = list(scratch_path.glob('*.md'))
+                if not mds:
+                    return None
+                shutil.move(str(mds[0]), str(thread_dir / output_name))
+            return output_name
         except ImportError:
             logger.warning("paper_pipeline not available for PDF processing")
             return None
@@ -882,12 +904,18 @@ class OutlookPipeline:
         """Process a PPTX attachment through the presentation pipeline."""
         try:
             from presentation_pipeline import PresentationPipeline
-            pipeline = PresentationPipeline(
-                input_folder=str(thread_dir),
-                output_dir=str(thread_dir),
-            )
-            pipeline.process_single_presentation(file_path, skip_existing=False)
-            return self._rename_newest_md(thread_dir, output_name)
+            with tempfile.TemporaryDirectory(dir=thread_dir) as scratch:
+                scratch_path = Path(scratch)
+                pipeline = PresentationPipeline(
+                    input_folder=str(thread_dir),
+                    output_dir=str(scratch_path),
+                )
+                pipeline.process_single_presentation(file_path, skip_existing=False)
+                mds = list(scratch_path.glob('*.md'))
+                if not mds:
+                    return None
+                shutil.move(str(mds[0]), str(thread_dir / output_name))
+            return output_name
         except ImportError:
             logger.warning("presentation_pipeline not available for PPTX processing")
             return None
@@ -1076,7 +1104,15 @@ class OutlookPipeline:
         try:
             import yaml  # type: ignore
             data = yaml.safe_load(path.read_text(encoding='utf-8'))
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            # yaml.safe_load auto-parses unquoted ISO dates (e.g. 2024-07-01) as
+            # datetime.date objects. Normalise them back to strings so comparisons work.
+            for field in ('first_seen', 'last_seen'):
+                val = data.get(field)
+                if val is not None and not isinstance(val, str):
+                    data[field] = str(val)
+            return data
         except Exception:
             return {}
 
@@ -1090,12 +1126,19 @@ class OutlookPipeline:
             needs_quotes = any(c in v for c in ':#@|,[]{}') or v.startswith(('+', '"', "'", '-'))
             return f'"{escaped}"' if needs_quotes else v
 
+        _date_fields = {'first_seen', 'last_seen'}
         lines: List[str] = []
         for field in ('name', 'email', 'phone', 'mobile', 'fax',
                       'title', 'department', 'organization', 'location', 'website',
                       'first_seen', 'last_seen'):
             if contact.get(field):
-                lines.append(f'{field}: {_q(str(contact[field]))}')
+                val = str(contact[field])
+                # Always quote date fields — unquoted ISO dates are parsed as
+                # datetime.date by yaml.safe_load, breaking string comparisons.
+                if field in _date_fields:
+                    lines.append(f'{field}: "{val}"')
+                else:
+                    lines.append(f'{field}: {_q(val)}')
 
         changes = contact.get('changes') or []
         if changes:
@@ -1190,7 +1233,8 @@ class OutlookPipeline:
     def _insert_change(changes: list, date: str, field: str, old: str, new: str):
         """Insert a change entry in chronological order, skipping exact duplicates."""
         for ch in changes:
-            if ch['date'] == date and ch['field'] == field and ch.get('new') == new:
+            if (ch['date'] == date and ch['field'] == field
+                    and ch.get('new') == new and ch.get('old') == old):
                 return
         entry = {'date': date, 'field': field, 'old': old, 'new': new}
         for i, ch in enumerate(changes):
@@ -1202,7 +1246,7 @@ class OutlookPipeline:
     @staticmethod
     def _first_change_date_for(changes: list, field: str, after: str) -> Optional[str]:
         """Return the earliest date in the change log for `field` that is after `after`."""
-        for ch in sorted(changes, key=lambda c: c['date']):
+        for ch in changes:
             if ch['field'] == field and ch['date'] > after:
                 return ch['date']
         return None
@@ -1389,7 +1433,12 @@ class OutlookPipeline:
 
                 unique_atts = []
                 for att in atts:
-                    key = (att['filename'], att['size_bytes'])
+                    if att['type'] == 'image':
+                        # Same logo sent in every email → deduplicate by content
+                        h = hashlib.md5(att['path'].read_bytes()).hexdigest()
+                        key = ('img', h)
+                    else:
+                        key = (att['filename'], att['size_bytes'])
                     if key not in seen_attachments:
                         seen_attachments.add(key)
                         unique_atts.append(att)
@@ -1403,14 +1452,30 @@ class OutlookPipeline:
                 attachment_count += len(unique_atts)
 
         # Phase 2: Route attachments to pipelines (may take minutes, COM not needed)
+        # Each attachment is independent — process them in parallel.
         if not self.no_attachments:
-            for entry_id, atts in all_attachments.items():
-                for att in atts:
-                    if att['type'] not in ('raw', 'image', 'too_large'):
-                        output = self._route_attachment(att, thread_dir)
-                        if output:
-                            att['processed'] = True
-                            att['output'] = output
+            routable = [
+                att
+                for atts in all_attachments.values()
+                for att in atts
+                if att['type'] not in ('raw', 'image', 'too_large')
+            ]
+            if routable:
+                max_workers = min(4, len(routable))
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {
+                        pool.submit(self._route_attachment, att, thread_dir): att
+                        for att in routable
+                    }
+                    for future in as_completed(futures):
+                        att = futures[future]
+                        try:
+                            output = future.result()
+                            if output:
+                                att['processed'] = True
+                                att['output'] = output
+                        except Exception as e:
+                            logger.warning(f"Attachment routing failed for {att['filename']}: {e}")
 
         # Phase 3: Generate thread markdown (uses only snapshot data)
         thread_md, contact_updates = self._generate_thread_markdown(
