@@ -33,7 +33,7 @@ class OutlookPipeline:
 
     OL_MAIL_ITEM = 43
     OL_FOLDER_INBOX = 6
-    MAX_ATTACHMENT_SIZE_MB = 50
+    MAX_ATTACHMENT_SIZE_MB = 15
 
     ATTACHMENT_PIPELINES = {
         '.pdf': 'paper',
@@ -694,7 +694,11 @@ class OutlookPipeline:
             size_bytes = staged_path.stat().st_size
             size_mb = size_bytes / (1024 * 1024)
             if size_mb > self.MAX_ATTACHMENT_SIZE_MB:
-                logger.warning(f"Attachment too large ({size_mb:.1f}MB): {filename}")
+                logger.warning(
+                    f"SKIPPED — attachment too large ({size_mb:.1f} MB > "
+                    f"{self.MAX_ATTACHMENT_SIZE_MB} MB limit): {filename} "
+                    f"[review manually: {staged_path}]"
+                )
                 staged_path.unlink(missing_ok=True)
                 continue
 
