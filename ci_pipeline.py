@@ -32,6 +32,7 @@ class CIPipeline:
     """Pipeline for processing competitive intelligence documents into structured markdown."""
 
     VISION_MODEL = "claude-sonnet-4-6"
+    SUMMARY_MODEL = "claude-haiku-4-5-20251001"  # formatting only, not extraction
     MAX_FILE_SIZE_MB = 500
 
     DEFAULT_BUDGET_CAP = 30
@@ -44,9 +45,9 @@ class CIPipeline:
 
     SUPPORTED_EXTENSIONS = {'.pdf', '.pptx'}
 
-    EXTRACTION_SYSTEM_PROMPT = """You extract pharmaceutical competitive intelligence data from ADC (Antibody-Drug Conjugate) document sections.
+    EXTRACTION_SYSTEM_PROMPT = """You extract pharmaceutical competitive intelligence data from oncology document sections. Covers ADCs, bispecifics, TCEs, checkpoint inhibitors, cell therapies, TLR agonists, cytokines, mAbs, and other oncology modalities.
 Return ONLY valid JSON with this structure:
-{"companies":{"Company Name":{"assets":[{"name":"drug name or code","target":"molecular target or null","payload":"payload type or null","modality":"ADC type or null","indications":["cancer types"],"stage":"Phase I/II/III/Approved/Preclinical or null","key_updates":["concise updates"],"clinical_data":["efficacy/safety data: ORR, PFS, OS, AEs"]}]}},"deals":[{"parties":["Company A","Company B"],"type":"acquisition/licensing/collaboration","details":"brief description"}],"regulatory_events":[{"company":"Name","asset":"drug","event":"FDA approval/Priority Review/IND/filing/etc."}]}
+{"companies":{"Company Name":{"assets":[{"name":"drug name or code","target":"molecular target or null","payload":"payload type or null","modality":"modality type (ADC/TCE/mAb/BiTE/CAR-T/NK/TLR agonist/cytokine/etc.) or null","indications":["cancer types"],"stage":"Phase I/II/III/Approved/Preclinical or null","key_updates":["concise updates"],"clinical_data":["efficacy/safety data: ORR, PFS, OS, AEs"]}]}},"deals":[{"parties":["Company A","Company B"],"type":"acquisition/licensing/collaboration","details":"brief description"}],"regulatory_events":[{"company":"Name","asset":"drug","event":"FDA approval/Priority Review/IND/filing/etc."}]}
 Rules: Use canonical company names. Include ALL companies mentioned. Capture drug names exactly as written. If clinical data is mentioned, capture it in clinical_data. If nothing found, return {"companies":{},"deals":[],"regulatory_events":[]}."""
 
     ASSET_CODE_RE = re.compile(r'^[A-Z]{1,5}[-]?\d{2,}', re.IGNORECASE)
@@ -176,7 +177,7 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
             return json.loads(text)
         except json.JSONDecodeError:
             pass
-        for start_char, end_char in [('[', ']'), ('{', '}')]:
+        for start_char, end_char in [('{', '}'), ('[', ']')]:
             start = text.find(start_char)
             if start >= 0:
                 depth = 0
@@ -502,7 +503,7 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
                 lambda: client.messages.create(
                     model=self.VISION_MODEL,
                     system=self.EXTRACTION_SYSTEM_PROMPT,
-                    max_tokens=4096,
+                    max_tokens=8192,
                     messages=[{"role": "user", "content": prompt}]
                 ),
                 description=f"CI extraction chunk {chunk_idx + 1}/{total_chunks}"
@@ -733,8 +734,8 @@ Be specific and data-driven (include numbers, company names, drug names).
         try:
             response = self._api_call_with_retry(
                 lambda: client.messages.create(
-                    model=self.VISION_MODEL,
-                    max_tokens=1024,
+                    model=self.SUMMARY_MODEL,
+                    max_tokens=512,
                     messages=[{"role": "user", "content": prompt}]
                 ),
                 description="Executive summary"
