@@ -735,7 +735,7 @@ Be specific and data-driven (include numbers, company names, drug names).
             response = self._api_call_with_retry(
                 lambda: client.messages.create(
                     model=self.SUMMARY_MODEL,
-                    max_tokens=512,
+                    max_tokens=1024,
                     messages=[{"role": "user", "content": prompt}]
                 ),
                 description="Executive summary"

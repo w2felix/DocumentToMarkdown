@@ -118,6 +118,26 @@ class PaperPipeline:
 
         self.quality_log_path = self.output_dir / 'quality_log.tsv'
 
+    @classmethod
+    def from_file(cls, pdf_path, *, max_vision_pages: int = 8,
+                  budget: int = 50, **kwargs):
+        """Create an instance for processing a single file (no output dir needed).
+
+        Used by the doc2md public API for programmatic access.
+        """
+        pdf_path = Path(pdf_path)
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="doc2md_")
+        instance = cls(
+            input_folder=str(pdf_path.parent),
+            output_dir=tmpdir,
+            max_vision_pages=max_vision_pages,
+            budget=budget,
+            **kwargs,
+        )
+        instance._tmpdir = tmpdir
+        return instance
+
     # ─── API Client ───────────────────────────────────────────────────────────
 
     def get_anthropic_client(self):
@@ -762,11 +782,23 @@ Paper text:
         return captions
 
     def analyze_figures_batch(self, pdf_path: Path, figure_pages: List[int],
-                              full_text: str) -> List[Dict]:
-        """Analyze figure pages with Vision AI in batches."""
+                              full_text: str, *,
+                              include_images: bool = False,
+                              dpi: int = None) -> List[Dict]:
+        """Analyze figure pages with Vision AI in batches.
+
+        Args:
+            include_images: If True, each result dict includes 'image_bytes' (JPEG).
+            dpi: Override render resolution (default: self.RENDER_DPI = 200).
+
+        Returns list of dicts with keys: figure_number, title, figure_type,
+        description, key_findings, statistical_notes, relevance, page_num.
+        When include_images=True, also includes 'image_bytes'.
+        """
         if not figure_pages:
             return []
 
+        render_dpi = dpi or self.RENDER_DPI
         all_figures = []
         text_captions = self.extract_figure_captions_from_text(full_text)
         caption_context = "\n".join(
@@ -780,13 +812,24 @@ Paper text:
             if not self._track_api_call():
                 break
 
-            images = self.render_pages_to_images(pdf_path, batch)
+            images = self.render_pages_to_images(pdf_path, batch, dpi=render_dpi)
             if not images:
                 continue
 
+            # Optionally retain raw JPEG bytes for the caller
+            batch_image_bytes = {}
             content_blocks = []
             for page_num in batch:
                 if page_num in images:
+                    if include_images:
+                        from io import BytesIO as _BytesIO
+                        buf = _BytesIO()
+                        img = images[page_num]
+                        if img.mode == 'RGBA':
+                            img = img.convert('RGB')
+                        img.save(buf, format="JPEG", quality=85)
+                        batch_image_bytes[page_num] = buf.getvalue()
+
                     encoded, media_type = self.encode_image_to_base64(images[page_num])
                     images[page_num].close()
                     if encoded:
@@ -811,9 +854,15 @@ For each figure, return a JSON array:
     "figure_type": "bar chart / line plot / scatter plot / heatmap / diagram / microscopy / gel / flow chart / other",
     "description": "what the figure shows (2-3 sentences)",
     "key_findings": ["finding 1", "finding 2"],
-    "statistical_notes": "any p-values, significance markers, sample sizes"
+    "statistical_notes": "any p-values, significance markers, sample sizes",
+    "relevance": "HIGH / MEDIUM / LOW"
   }}
 ]
+
+Relevance scoring rubric:
+  HIGH = overview or summary figure, key clinical outcome (survival, ORR, response), essential mechanistic diagram, landscape/pipeline overview, multi-panel summary
+  MEDIUM = individual experimental result, supporting methods, secondary validation, single-assay result
+  LOW = technical detail only, minor supplementary-level content, formatting/legend page
 
 Return ONLY the JSON array."""
 
@@ -827,10 +876,13 @@ Return ONLY the JSON array."""
                     messages=[{"role": "user", "content": content_blocks}]
                 )
                 result = self.parse_json_response(response.content[0].text)
-                if isinstance(result, list):
-                    all_figures.extend(result)
-                elif isinstance(result, dict):
-                    all_figures.append(result)
+                items = result if isinstance(result, list) else [result] if isinstance(result, dict) else []
+                for idx, item in enumerate(items):
+                    item.setdefault('relevance', 'MEDIUM')
+                    item['page_num'] = batch[min(idx, len(batch) - 1)]
+                    if include_images and item['page_num'] in batch_image_bytes:
+                        item['image_bytes'] = batch_image_bytes[item['page_num']]
+                all_figures.extend(items)
             except Exception as e:
                 logger.error(f"Figure analysis batch failed: {e}")
 
