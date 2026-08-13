@@ -59,6 +59,7 @@ def get_anthropic_client():
             api_key="foundry-bearer-auth-not-used",
             base_url=base_url,
             default_headers={"Authorization": f"Bearer {auth_token}"},
+            timeout=120,
         )
     elif api_key:
         _anthropic_client = anthropic.Anthropic(api_key=api_key)

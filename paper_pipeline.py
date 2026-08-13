@@ -431,6 +431,8 @@ class PaperPipeline:
         lines = first_page.split('\n')
         skip_patterns = re.compile(
             r'^(Article|Letter|Review|Report|Research|Original|Open\s+access|'
+            r'Technical\s+Report|Research\s+Article|Brief\s+Communication|'
+            r'News\s+&\s+Views|Comment|Correspondence|Perspective|Editorial|'
             r'https?://|doi:|Received|Accepted|Published|Check for|©|\d+\s*$)',
             re.IGNORECASE
         )
@@ -491,7 +493,7 @@ class PaperPipeline:
             # Stop at date/metadata lines
             if re.match(r'^(Received|Accepted|Published|Open access|Check for)', line.strip()):
                 break
-            if line.strip() and re.search(r'[A-Z][a-z]+', line):
+            if line.strip() and re.search(r'[A-Z][a-z]+', line) and len(line.strip()) <= 150:
                 author_lines.append(line.strip())
             if len(author_lines) >= 3:
                 break
@@ -808,15 +810,16 @@ Paper text:
         batches = [figure_pages[i:i + self.PAGES_PER_VISION_BATCH]
                    for i in range(0, len(figure_pages), self.PAGES_PER_VISION_BATCH)]
 
-        for batch in batches:
-            if not self._track_api_call():
-                break
+        # Pre-check budget for all batches at once (avoids non-atomic per-batch tracking
+        # in parallel execution).
+        if not self._track_api_call(len(batches)):
+            return all_figures
 
+        def _process_batch(batch):
             images = self.render_pages_to_images(pdf_path, batch, dpi=render_dpi)
             if not images:
-                continue
+                return []
 
-            # Optionally retain raw JPEG bytes for the caller
             batch_image_bytes = {}
             content_blocks = []
             for page_num in batch:
@@ -839,7 +842,7 @@ Paper text:
                         })
 
             if not content_blocks:
-                continue
+                return []
 
             prompt = f"""Analyze all figures and charts visible in these pages from a scientific paper.
 
@@ -882,9 +885,14 @@ Return ONLY the JSON array."""
                     item['page_num'] = batch[min(idx, len(batch) - 1)]
                     if include_images and item['page_num'] in batch_image_bytes:
                         item['image_bytes'] = batch_image_bytes[item['page_num']]
-                all_figures.extend(items)
+                return items
             except Exception as e:
                 logger.error(f"Figure analysis batch failed: {e}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for batch_results in executor.map(_process_batch, batches):
+                all_figures.extend(batch_results)
 
         return all_figures
 
