@@ -7,10 +7,17 @@ from pipeline_security import validate_base_url
 
 
 def _load_credentials():
-    """Load Anthropic credentials from Windows registry into environment if not already set."""
+    """Load Anthropic credentials into environment if not already set."""
     needed = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY")
     if all(os.environ.get(v) for v in needed[:2]) or os.environ.get(needed[2]):
         return
+    try:
+        from credentials_loader import load_credentials as _load_from_toml
+        _load_from_toml()
+        if all(os.environ.get(v) for v in needed[:2]) or os.environ.get(needed[2]):
+            return
+    except Exception:
+        pass
     if sys.platform != "win32":
         return
     try:

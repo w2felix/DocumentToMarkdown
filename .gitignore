@@ -1,3 +1,6 @@
+# Credentials (per-repo, machine-specific)
+.anthropic-credentials.toml
+
 # Python
 __pycache__/
 *.py[cod]
