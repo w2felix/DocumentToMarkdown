@@ -1307,10 +1307,14 @@ Return ONLY valid JSON."""
                 continue
             title = slide.get('title') or ''
             text = ' '.join(slide.get('text_blocks', []))
-            if title or text:
-                slide_text.append(f"Slide {slide['number']}: {title}\n{text}")
+            visual_elements = slide.get('visual_elements') or ''
+            if title or text or visual_elements:
+                entry = f"Slide {slide['number']}: {title}\n{text}"
+                if visual_elements:
+                    entry += f"\nVisual elements: {visual_elements}"
+                slide_text.append(entry)
 
-        combined = '\n\n'.join(slide_text)[:12000]
+        combined = '\n\n'.join(slide_text)[:24000]
 
         language_instruction = ""
         if language != 'en':
@@ -1467,7 +1471,8 @@ Format your response as:
                                 has_summary: bool) -> Dict:
         scores = {}
 
-        total_chars = sum(len(' '.join(s.get('text_blocks', []))) for s in slides_data)
+        total_chars = sum(len(' '.join(s.get('text_blocks', []))) + len(s.get('visual_elements') or '')
+                          for s in slides_data)
         chars_per_slide = total_chars / max(num_slides, 1)
         scores['text_extraction'] = round(min(10, chars_per_slide / 60), 1)
 

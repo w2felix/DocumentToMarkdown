@@ -260,7 +260,7 @@ class PaperPipeline:
             with pdfplumber.open(str(pdf_path)) as pdf:
                 total_pages = len(pdf.pages)
                 for i, page in enumerate(pdf.pages):
-                    text = page.extract_text() or ""
+                    text = self._extract_page_text_column_aware(page)
                     char_count = len(text.strip())
 
                     classification = self._classify_page(text, i, total_pages)
@@ -282,6 +282,119 @@ class PaperPipeline:
                 method = "ocr"
 
         return page_data, method
+
+    def _extract_page_text_column_aware(self, page) -> str:
+        """Extract text from a page, detecting two-column layouts (IEEE, ACM,
+        many journal PDFs) and reading each column top-to-bottom instead of
+        interleaving them line-by-line as pdfplumber's default extract_text()
+        does.
+
+        Detection: histogram word x0 (starting) positions in the middle third
+        of the page. A two-column layout leaves an empty "gutter" band where
+        no word begins; find the widest such gap. When the gap is >=10pt and
+        each side of the split carries >=20% of body words, split there and
+        extract left + right columns separately via `page.within_bbox`.
+        Otherwise fall back to pdfplumber's default single-flow extraction.
+
+        The top/bottom ~5% band (headers/footers/page numbers) is excluded
+        from detection so running headers don't skew the histogram. Words
+        that span the split line (wide titles, full-width equations) are
+        tolerated because detection uses word START positions, not extents.
+        """
+        try:
+            words = page.extract_words(use_text_flow=False, keep_blank_chars=False) or []
+        except Exception:
+            return page.extract_text() or ""
+
+        if len(words) < 40:
+            return page.extract_text() or ""
+
+        page_width = float(page.width or 0)
+        page_height = float(page.height or 0)
+        if page_width <= 0 or page_height <= 0:
+            return page.extract_text() or ""
+
+        top_band = page_height * 0.05
+        bot_band = page_height * 0.95
+        body = [
+            w for w in words
+            if top_band <= float(w.get('top', 0)) <= bot_band
+        ]
+        if len(body) < 40:
+            return page.extract_text() or ""
+
+        # Find the widest empty x0-gap in the middle third of the page.
+        # An empty gap means no word BEGINS anywhere in that x-range -
+        # a strong signal for a column gutter. Words spanning the gap
+        # (title, wide equation) don't disrupt this because we look at
+        # word.x0, not word.x1.
+        x0s = sorted(float(w['x0']) for w in body)
+        mid_lo = page_width * 0.33
+        mid_hi = page_width * 0.67
+        best_gap = 0.0
+        best_split = 0.0
+        for i in range(1, len(x0s)):
+            gap = x0s[i] - x0s[i - 1]
+            mid = (x0s[i] + x0s[i - 1]) / 2.0
+            if mid_lo <= mid <= mid_hi and gap > best_gap:
+                best_gap = gap
+                best_split = mid
+
+        if best_gap < 10.0:
+            return page.extract_text() or ""
+
+        split_x = best_split
+        left_frac = sum(1 for w in body if float(w['x0']) < split_x) / len(body)
+        right_frac = 1.0 - left_frac
+        if left_frac < 0.20 or right_frac < 0.20:
+            return page.extract_text() or ""
+
+        # Find where the two-column region starts. On the first page of most
+        # journal papers, the title/authors span the full page width above
+        # the columns; cropping straight into two bboxes chops those spanning
+        # lines mid-word. Locate the right column's dominant x0 (the modal
+        # start position of the right-side body) and treat only words whose
+        # x0 sits within ~4pt of that mode as genuine right-column starters.
+        # Title / affiliation words in the header band have random x0's and
+        # do not cluster at the column mode, so they are excluded. The
+        # topmost genuine starter marks the bottom of the header band.
+        from collections import Counter
+        right_x0_bins = Counter(round(float(w['x0'])) for w in body if float(w['x0']) >= split_x)
+        header_bottom = 0.0
+        if right_x0_bins:
+            right_mode_x0, _ = right_x0_bins.most_common(1)[0]
+            candidates = [
+                w for w in body
+                if abs(float(w['x0']) - right_mode_x0) <= 4.0
+            ]
+            starter_tops = sorted(float(w['top']) for w in candidates)
+            # A candidate is a genuine right-column line starter only if
+            # another candidate sits within 30pt below it - real column
+            # lines cluster densely in y, title/author words that happen
+            # to align horizontally are isolated. Take the first such
+            # clustered candidate as the top of the right column.
+            for i, t in enumerate(starter_tops):
+                if i + 1 < len(starter_tops) and (starter_tops[i + 1] - t) <= 30.0:
+                    header_bottom = max(t - 2.0, 0.0)
+                    break
+        try:
+            if header_bottom > page_height * 0.06:
+                header_crop = page.within_bbox((0, 0, page_width, header_bottom))
+                header_text = header_crop.extract_text() or ""
+            else:
+                header_text = ""
+            left_crop = page.within_bbox((0, header_bottom, split_x, page_height))
+            right_crop = page.within_bbox((split_x, header_bottom, page_width, page_height))
+            left_text = left_crop.extract_text() or ""
+            right_text = right_crop.extract_text() or ""
+        except Exception:
+            return page.extract_text() or ""
+
+        if not left_text.strip() and not right_text.strip() and not header_text.strip():
+            return page.extract_text() or ""
+
+        parts = [t for t in (header_text.rstrip(), left_text.strip(), right_text.strip()) if t]
+        return "\n\n".join(parts).strip()
 
     def _classify_page(self, text: str, page_num: int, total_pages: int) -> str:
         char_count = len(text.strip())
@@ -454,9 +567,25 @@ class PaperPipeline:
                     break
                 continue
             # Stop if we hit what looks like author names (multiple commas, affiliations)
+            # -- but only if we've already started collecting a title. Journal
+            # header lines (e.g. "IEEE TRANS... VOL.48, NO.6, JUNE 2026 6393")
+            # match the same pattern and would otherwise abort extraction
+            # before the title line is reached.
             if re.search(r'\d{1,2}[,\s]+\d', line) and ',' in line:
-                break
+                if collecting:
+                    break
+                continue
             if re.search(r'✉|correspondence|@', line, re.IGNORECASE):
+                if collecting:
+                    break
+                continue
+            # Author-line signature: multiple CamelCase name-runs joined by
+            # commas (e.g. "PhilipNaumann ,JacobKauffmann ,andGrégoireMontavon"
+            # -- typical of PDF extractions that drop first-last spaces).
+            if collecting and (
+                len(re.findall(r'\b[A-Z][a-z]+[A-Z][a-z]+', line)) >= 2
+                or re.search(r',\s*(?:and\s+)?[A-Z]\w+.*,\s*(?:and\s+)?[A-Z]\w+', line)
+            ):
                 break
             # Likely a title line if it's substantial text
             if len(line) > 15 and not re.match(r'^\d+\.', line):
@@ -473,6 +602,52 @@ class PaperPipeline:
     def _extract_authors_from_first_page(self, first_page: str) -> List[str]:
         """Extract author names from first page."""
         lines = first_page.split('\n')
+
+        # Fast path: IEEE/ACM/many journals put authors on the line(s)
+        # immediately before "Abstract—". Grab that block first - it's far
+        # more reliable than the DOI-anchored heuristic below, which fails
+        # when the DOI appears in the page footer (IEEE) rather than the
+        # header (Nature).
+        abs_pos_match = re.search(r'\n\s*Abstract\s*[—–\-:]', first_page)
+        if abs_pos_match:
+            head = first_page[: abs_pos_match.start()]
+            head_lines = [ln.strip() for ln in head.split('\n') if ln.strip()]
+            # Walk backwards from Abstract, take up to 3 non-title lines that
+            # look like an author block (contain commas or CamelCase name
+            # runs), stopping when we hit a plain title-length line without
+            # comma structure.
+            author_block: list[str] = []
+            for ln in reversed(head_lines):
+                has_multi_name = (
+                    len(re.findall(r'\b[A-Z][a-z]+[A-Z][a-z]+', ln)) >= 2
+                    or (ln.count(',') >= 1 and re.search(r'[A-Z][a-z]', ln))
+                )
+                if has_multi_name:
+                    author_block.insert(0, ln)
+                    if len(author_block) >= 3:
+                        break
+                elif author_block:
+                    break
+            if author_block:
+                raw = ' '.join(author_block)
+                # Normalize: insert space between "CamelCaseName" name-runs so
+                # split works. "PhilipNaumann" -> "Philip Naumann".
+                raw = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', raw)
+                # Strip superscripts, footnote markers, ORCID glyphs.
+                raw = re.sub(r'[\d]+', '', raw)
+                raw = re.sub(r'[✉*†‡§¶]', '', raw)
+                raw = raw.replace(' & ', ', ')
+                raw = re.sub(r'\band\b', ',', raw, flags=re.IGNORECASE)
+                out: list[str] = []
+                for part in raw.split(','):
+                    name = ' '.join(part.split()).strip(' .,')
+                    if len(name) < 4 or not re.match(r'^[A-Z]', name):
+                        continue
+                    words = name.split()
+                    if len(words) >= 2 and all(w for w in words):
+                        out.append(name)
+                if out:
+                    return out[:20]
 
         # Strategy: find lines after DOI/title that contain multiple names with
         # superscript numbers, commas, and affiliation markers
@@ -623,6 +798,23 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
         if not page_data:
             return None
         first_page = page_data[0]['text']
+
+        # Fast path: IEEE/ACM/many journals mark the abstract with "Abstract—",
+        # "Abstract-", or "Abstract:" (Unicode em-dash or hyphen). When that
+        # marker is present, take everything from just after it up to the next
+        # section marker ("Index Terms", "Keywords", "I. INTRODUCTION", etc.).
+        # This bypasses the paragraph-heuristic which is fragile on layouts
+        # where the DOI/dates appear AFTER the abstract (IEEE) rather than
+        # before it (Nature).
+        abs_match = re.search(
+            r'Abstract\s*[—–\-:]\s*(.+?)(?=\n\s*(?:Index\s+Terms|Keywords|I\.?\s+INTRODUCTION|1\.?\s+Introduction)\b)',
+            first_page,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if abs_match:
+            candidate = re.sub(r'\s+', ' ', abs_match.group(1)).strip()
+            if len(candidate) > 200:
+                return candidate
 
         # Many papers have the abstract as a paragraph after metadata
         # Look for a long paragraph (>200 chars) that starts with a capital letter
