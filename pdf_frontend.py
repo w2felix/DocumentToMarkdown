@@ -12,8 +12,8 @@ Contract: :func:`extract_pages` returns a :class:`FrontendResult` with a
 document-level flags. If pdf-inspector is missing or throws, callers should
 catch and fall through to the legacy pdfplumber path.
 
-Enabled via the ``DOC2MD_USE_PDF_INSPECTOR=1`` environment variable in
-``paper_pipeline.characterize_pdf``. Off by default during rollout.
+Used by default in ``paper_pipeline.characterize_pdf``. Set
+``DOC2MD_USE_PDF_INSPECTOR=0`` to force the legacy pdfplumber path.
 """
 from __future__ import annotations
 

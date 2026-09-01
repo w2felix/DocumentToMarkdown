@@ -252,13 +252,13 @@ class PaperPipeline:
         Returns (page_data, extraction_method) where page_data is a list of dicts:
             {page_num, text, char_count, classification}
 
-        When the ``DOC2MD_USE_PDF_INSPECTOR`` env var is set to ``1``, the
-        Rust-backed pdf-inspector frontend is used. It parses layout (columns,
-        tables) once and flags per-page OCR need, so we OCR only the pages
-        that need it instead of the whole document. Any failure falls through
-        to the legacy pdfplumber path silently.
+        Uses the Rust-backed pdf-inspector frontend by default (parses
+        layout once, flags per-page OCR need, OCRs only what needs it).
+        Set ``DOC2MD_USE_PDF_INSPECTOR=0`` to force the legacy pdfplumber
+        path. Any failure of the new path falls through to the legacy
+        extractor silently.
         """
-        if os.getenv("DOC2MD_USE_PDF_INSPECTOR", "0") == "1":
+        if os.getenv("DOC2MD_USE_PDF_INSPECTOR", "1") == "1":
             try:
                 result = self._characterize_pdf_inspector(pdf_path)
                 if result is not None:
