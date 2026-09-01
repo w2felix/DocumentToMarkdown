@@ -16,6 +16,10 @@ pywin32>=306; sys_platform == "win32"
 # PDF text extraction (native)
 pdfplumber>=0.10.0
 
+# Fast Rust-backed PDF -> markdown frontend (layout, columns, per-page OCR flags).
+# Optional: enabled via DOC2MD_USE_PDF_INSPECTOR=1 in paper_pipeline.
+pdf-inspector>=1.17
+
 # PDF manipulation and figure extraction
 PyMuPDF>=1.23.0  # Also known as 'fitz'
 

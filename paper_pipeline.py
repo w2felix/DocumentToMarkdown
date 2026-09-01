@@ -251,7 +251,68 @@ class PaperPipeline:
 
         Returns (page_data, extraction_method) where page_data is a list of dicts:
             {page_num, text, char_count, classification}
+
+        When the ``DOC2MD_USE_PDF_INSPECTOR`` env var is set to ``1``, the
+        Rust-backed pdf-inspector frontend is used. It parses layout (columns,
+        tables) once and flags per-page OCR need, so we OCR only the pages
+        that need it instead of the whole document. Any failure falls through
+        to the legacy pdfplumber path silently.
         """
+        if os.getenv("DOC2MD_USE_PDF_INSPECTOR", "0") == "1":
+            try:
+                result = self._characterize_pdf_inspector(pdf_path)
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning(
+                    f"pdf-inspector frontend failed, falling back to pdfplumber: {e}"
+                )
+        return self._characterize_pdf_pdfplumber(pdf_path)
+
+    def _characterize_pdf_inspector(self, pdf_path: Path) -> Optional[Tuple[List[Dict], str]]:
+        """pdf-inspector-driven page characterization with targeted OCR."""
+        import pdf_frontend
+
+        fr = pdf_frontend.extract_pages(pdf_path)
+        if not fr.page_data:
+            return None
+
+        total = len(fr.page_data)
+        for p in fr.page_data:
+            p["classification"] = self._classify_page(
+                p["text"], p["page_num"], total
+            )
+        self._last_frontend_flags = fr.doc_flags
+
+        if fr.pages_needing_ocr:
+            logger.info(
+                f"  pdf-inspector flagged {len(fr.pages_needing_ocr)} of "
+                f"{total} pages for OCR"
+            )
+            patched = self._ocr_pages(pdf_path, fr.pages_needing_ocr)
+            if patched:
+                by_num = {p["page_num"]: p for p in patched}
+                for p in fr.page_data:
+                    if p["page_num"] in by_num:
+                        p.update(by_num[p["page_num"]])
+                        p["classification"] = self._classify_page(
+                            p["text"], p["page_num"], total
+                        )
+
+        # Safety net: if the whole doc is still empty, fall back to full OCR
+        # so we don't ship a blank extraction. Matches legacy behavior.
+        if all(p["char_count"] < self.MIN_TEXT_FOR_TEXT_PAGE for p in fr.page_data):
+            logger.info(
+                "  pdf-inspector output below text threshold, running full OCR"
+            )
+            ocr_data = self._ocr_pages(pdf_path, None)
+            if ocr_data:
+                return ocr_data, "ocr"
+
+        return fr.page_data, fr.method
+
+    def _characterize_pdf_pdfplumber(self, pdf_path: Path) -> Tuple[List[Dict], str]:
+        """Legacy pdfplumber-based page characterization (default path)."""
         import pdfplumber
 
         page_data = []
@@ -277,7 +338,7 @@ class PaperPipeline:
 
         if not page_data or all(p['char_count'] < self.MIN_TEXT_FOR_TEXT_PAGE for p in page_data):
             logger.info("  Native text extraction failed or low quality, trying OCR...")
-            ocr_data = self._ocr_all_pages(pdf_path)
+            ocr_data = self._ocr_pages(pdf_path, None)
             if ocr_data:
                 page_data = ocr_data
                 method = "ocr"
@@ -417,7 +478,13 @@ class PaperPipeline:
 
         return 'TEXT_PAGE'
 
-    def _ocr_all_pages(self, pdf_path: Path) -> Optional[List[Dict]]:
+    def _ocr_pages(self, pdf_path: Path,
+                   page_indices: Optional[List[int]] = None) -> Optional[List[Dict]]:
+        """OCR the given 0-indexed pages. ``None`` means every page.
+
+        Returns a page_data list restricted to the OCR'd pages, with the
+        same shape ``characterize_pdf`` produces. Returns ``None`` on error.
+        """
         try:
             import fitz
             from PIL import Image
@@ -428,9 +495,12 @@ class PaperPipeline:
             doc = fitz.open(str(pdf_path))
             try:
                 total_pages = len(doc)
+                indices = (list(range(total_pages))
+                           if page_indices is None
+                           else [i for i in page_indices if 0 <= i < total_pages])
                 zoom = self.DEFAULT_OCR_DPI / 72
                 mat = fitz.Matrix(zoom, zoom)
-                for i in range(total_pages):
+                for i in indices:
                     pix = doc[i].get_pixmap(matrix=mat)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     text = pytesseract.image_to_string(img)
@@ -449,6 +519,10 @@ class PaperPipeline:
         except Exception as e:
             logger.error(f"OCR failed: {e}")
             return None
+
+    def _ocr_all_pages(self, pdf_path: Path) -> Optional[List[Dict]]:
+        """Backward-compatible wrapper: OCR every page."""
+        return self._ocr_pages(pdf_path, None)
 
     # ─── Full Text Assembly ───────────────────────────────────────────────────
 
