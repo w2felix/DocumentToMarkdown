@@ -96,7 +96,13 @@ class PaperPipeline:
     FILENAME_PATTERN = re.compile(r'^(.+?)\s+et\s+al\.\s*[-–—]\s*(\d{4})\s*[-–—]\s*(.+)$')
     FILENAME_PATTERN_SIMPLE = re.compile(r'^(.+?)\s*[-–—]\s*(\d{4})\s*[-–—]\s*(.+)$')
 
-    DOI_PATTERN = re.compile(r'(?:doi|DOI|https?://doi\.org/)[\s:]*(10\.\d{4,}/[^\s,;]+)')
+    # DOI syntax: 10.<registrant>/<suffix>. Suffix must start with an
+    # alphanumeric (rules out markdown pipes/asterisks/etc.) and stops at
+    # bracket/whitespace/comma/semicolon.
+    DOI_PATTERN = re.compile(
+        r'(?:doi|DOI|https?://doi\.org/)[\s:]*'
+        r'(10\.\d{4,}/[A-Za-z0-9][A-Za-z0-9\-._/:]*)'
+    )
     YEAR_PATTERN = re.compile(r'\b(19[89]\d|20[012]\d)\b')
 
     def __init__(self, input_folder: str, output_dir: str = "output_papers",
@@ -557,6 +563,15 @@ class PaperPipeline:
             metadata['title_hint'] = match.group(3).strip()
             return metadata
 
+        # Vault-style: "Surname YYYY - kebab-title" (no dash before the year).
+        # Common in the Obsidian vault, so mine it for Crossref hints.
+        vault_match = re.match(
+            r'^([A-Z][A-Za-z\-]+)\s+(\d{4})\s*[-–—]\s*(.+)$', stem)
+        if vault_match:
+            metadata['first_author'] = vault_match.group(1)
+            metadata['year'] = vault_match.group(2)
+            metadata['title_hint'] = vault_match.group(3).strip()
+
         return metadata
 
     def extract_metadata_from_text(self, full_text: str, page_data: List[Dict]) -> Dict[str, Any]:
@@ -565,10 +580,13 @@ class PaperPipeline:
         first_page = page_data[0]['text'] if page_data else ""
         first_pages_text = '\n'.join(p['text'] for p in page_data[:2])
 
-        # DOI
-        doi_match = self.DOI_PATTERN.search(first_pages_text)
+        # DOI - search the first 2 pages first (typical journal header
+        # placement), then fall back to the full text for reviews/perspectives
+        # that print the DOI only in the footer.
+        doi_match = (self.DOI_PATTERN.search(first_pages_text)
+                     or self.DOI_PATTERN.search(full_text))
         if doi_match:
-            doi = doi_match.group(1).rstrip('.)')
+            doi = doi_match.group(1).rstrip('.),;')
             metadata['doi'] = doi
 
         # Year - look for publication year patterns
@@ -830,7 +848,17 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
 
     def merge_metadata(self, vision_meta: Dict, text_meta: Dict,
                        filename_meta: Dict) -> Dict[str, Any]:
-        """Merge metadata from all sources. Priority: Vision > Text > Filename."""
+        """Merge metadata from all sources.
+
+        Priority:
+          - title/authors/year/journal/volume/pages/doi: Crossref (when a
+            DOI resolves) > Vision > Text > Filename
+          - abstract/keywords/affiliations/correspondence: Vision > Text
+
+        Crossref is deterministic and defeats vision-based author
+        hallucination (correct surname, invented given-name). Set
+        ``DOC2MD_DISABLE_CROSSREF=1`` to skip the Crossref lookup.
+        """
         merged = {}
 
         merged['title'] = (vision_meta.get('title') or
@@ -866,7 +894,90 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
             first_author = parts[-1] if parts else first_name
         merged['first_author'] = first_author or 'Unknown'
 
+        if os.getenv("DOC2MD_DISABLE_CROSSREF", "0") != "1":
+            self._apply_crossref(merged, vision_meta, text_meta, filename_meta)
+
         return merged
+
+    def _apply_crossref(self, merged: Dict[str, Any],
+                        vision_meta: Dict, text_meta: Dict,
+                        filename_meta: Dict) -> None:
+        """Override merged metadata with Crossref when a DOI resolves.
+
+        Mutates ``merged`` in place. Silent no-op on any failure so a
+        Crossref outage never blocks paper ingestion.
+        """
+        try:
+            import crossref_meta as _cr
+        except Exception:
+            return
+
+        def _title_lookup() -> Optional[dict]:
+            title = (merged.get('title') or '').lstrip('#').strip()
+            if not title or title.lower() == 'untitled':
+                title = filename_meta.get('title_hint') or ''
+                title = title.replace('-', ' ').strip()
+            if not title:
+                return None
+            first = merged.get('first_author') or filename_meta.get('first_author')
+            if first and first.lower() in ('unknown', 'et', 'al'):
+                first = None
+            resolved = _cr.resolve_doi_by_title(title, first)
+            if resolved:
+                logger.info(f"  Crossref: title -> DOI {resolved}")
+                return _cr.fetch_by_doi(resolved)
+            return None
+
+        try:
+            doi = merged.get('doi')
+            record = _cr.fetch_by_doi(doi) if doi else None
+
+            # Sanity check: if filename encodes a first-author surname and
+            # Crossref returned a different family, the DOI is probably from
+            # a paper *cited* on page 1, not this paper. Try the title path.
+            fname_author = (filename_meta.get('first_author') or '').lower()
+            if record and fname_author:
+                cr_first = next(
+                    (a for a in record.get('authors', [])
+                     if a.get('sequence') == 'first'),
+                    None,
+                ) or (record.get('authors') or [None])[0]
+                cr_family = ((cr_first or {}).get('family') or '').lower()
+                if cr_family and cr_family != fname_author:
+                    logger.info(
+                        f"  Crossref: DOI first-author '{cr_family}' does not "
+                        f"match filename '{fname_author}', retrying via title"
+                    )
+                    alt = _title_lookup()
+                    if alt:
+                        record = alt
+                    else:
+                        logger.info(
+                            "  Crossref: title fallback returned nothing; "
+                            "discarding mismatched DOI record"
+                        )
+                        record = None
+                        merged['doi'] = None
+
+            if not record:
+                record = _title_lookup()
+            overrides = _cr.reconcile(text_meta, vision_meta, record)
+            if not overrides:
+                return
+
+            for k in ('title', 'authors', 'year', 'journal',
+                      'volume', 'pages', 'doi'):
+                if overrides.get(k):
+                    merged[k] = overrides[k]
+            if overrides.get('first_author'):
+                merged['first_author'] = overrides['first_author']
+            merged['_crossref_verified'] = True
+            logger.info(
+                f"  Crossref: canonical metadata applied "
+                f"(doi={merged.get('doi')}, authors={len(merged.get('authors') or [])})"
+            )
+        except Exception as e:
+            logger.debug(f"  Crossref reconciliation skipped: {e}")
 
     def _extract_abstract_from_first_page(self, page_data: List[Dict]) -> Optional[str]:
         """Try to extract abstract from first page text as a continuous paragraph."""
