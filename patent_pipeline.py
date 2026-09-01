@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # Load credentials and shared auth
 from pipeline_security import validate_path, validate_output_path, sanitize_filename
 from auth import get_anthropic_client as _get_shared_client
+from anthropic_helpers import first_text
 
 
 class PatentPipeline:
@@ -669,7 +670,7 @@ class PatentPipeline:
                 max_tokens=4096 * len(valid_pages),
                 messages=[{"role": "user", "content": content}]
             )
-            response_text = response.content[0].text
+            response_text = first_text(response)
             logger.info(f"    Batch {batch_idx+1}: {len(response_text)} chars "
                         f"(in:{response.usage.input_tokens}, out:{response.usage.output_tokens})")
             return self._parse_enhanced_text_response(response_text, valid_pages)
@@ -833,7 +834,7 @@ Return ONLY a JSON array like: [{{"page": 55, "type": "text"}}, {{"page": 111, "
                 max_tokens=1024,
                 messages=[{"role": "user", "content": content}]
             )
-            results = self.parse_json_response(response.content[0].text)
+            results = self.parse_json_response(first_text(response))
             if results:
                 return self._infer_page_boundaries(results, valid_indices, total)
         except Exception as e:
@@ -1112,7 +1113,7 @@ Start with ===PAGE {valid_pages[0] + 1}==="""
                 max_tokens=4096 * len(valid_pages),
                 messages=[{"role": "user", "content": content}]
             )
-            return self._parse_enhanced_text_response(response.content[0].text, valid_pages)
+            return self._parse_enhanced_text_response(first_text(response), valid_pages)
         except Exception as e:
             logger.error(f"  OCR batch {batch_idx} API call failed: {e}")
             return {}
@@ -1222,7 +1223,7 @@ Important:
                     ]
                 }]
             )
-            result = self.parse_json_response(response.content[0].text)
+            result = self.parse_json_response(first_text(response))
             if result:
                 logger.info(f"  Vision AI extracted: {list(result.keys())}")
                 return result
@@ -1511,7 +1512,7 @@ Important:
                 max_tokens=4096,
                 messages=[{"role": "user", "content": content}]
             )
-            return self._parse_figure_response(response.content[0].text, rendered_pages)
+            return self._parse_figure_response(first_text(response), rendered_pages)
         except Exception as e:
             logger.error(f"  Vision API call failed for batch {batch_idx}: {e}")
             return []
@@ -1645,7 +1646,7 @@ Max 10 compounds, max 10 biological results. Return ONLY valid JSON."""
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}]
             )
-            result = self.parse_json_response(response.content[0].text)
+            result = self.parse_json_response(first_text(response))
             if result:
                 compounds = result.get('key_compounds', [])
                 bio_results = result.get('biological_results', [])
@@ -1813,7 +1814,7 @@ Return ONLY the JSON array. No other text."""
                 max_tokens=1024 * max(1, len(figs_on_page)),
                 messages=[{"role": "user", "content": content}]
             )
-            results = self.parse_json_response(response.content[0].text)
+            results = self.parse_json_response(first_text(response))
             if not isinstance(results, list):
                 results = [results] if results else []
 
@@ -1911,7 +1912,7 @@ Format your response EXACTLY as:
                 max_tokens=2048,
                 messages=[{"role": "user", "content": prompt}]
             )
-            text = response.content[0].text
+            text = first_text(response)
             result = {}
 
             exec_match = re.search(r'---EXECUTIVE_SUMMARY---\s*(.*?)(?:---PROTECTION_SCOPE---|$)', text, re.DOTALL)

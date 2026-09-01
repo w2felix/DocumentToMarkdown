@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # Load credentials and shared auth
 from pipeline_security import validate_path, validate_output_path, sanitize_filename
 from auth import get_anthropic_client as _get_shared_client
+from anthropic_helpers import first_text
 
 
 class TalkPipeline:
@@ -329,7 +330,7 @@ Do NOT skip any data-containing slides."""
                 max_tokens=self.MAX_TOKENS_SLIDE_EXTRACTION,
                 messages=[{"role": "user", "content": content_blocks}]
             )
-            result = message.content[0].text
+            result = first_text(message)
             logger.info(f"  Batch {batch_start+1}-{batch_start+len(encoded_images)}: "
                        f"{len(result)} chars (in:{message.usage.input_tokens}, out:{message.usage.output_tokens})")
             return result
@@ -462,7 +463,7 @@ SECTION 2: Key Takeaways (4-7 bullet points)
                 max_tokens=self.MAX_TOKENS_SUMMARY + self.MAX_TOKENS_TAKEAWAYS,
                 messages=[{"role": "user", "content": prompt}]
             )
-            response = message.content[0].text
+            response = first_text(message)
             logger.info(f"Summary + takeaways: {len(response)} chars "
                        f"(in:{message.usage.input_tokens}, out:{message.usage.output_tokens})")
 

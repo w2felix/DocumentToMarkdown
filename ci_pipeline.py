@@ -25,6 +25,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 from auth import get_anthropic_client
+from anthropic_helpers import first_text
 from pipeline_security import validate_path, validate_output_path, sanitize_filename, check_pptx_safe
 
 
@@ -508,7 +509,7 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
                 ),
                 description=f"CI extraction chunk {chunk_idx + 1}/{total_chunks}"
             )
-            result = self.parse_json_response(response.content[0].text)
+            result = self.parse_json_response(first_text(response))
             if not result:
                 logger.warning(f"  Chunk {chunk_idx + 1}: failed to parse JSON response")
             return result
@@ -740,7 +741,7 @@ Be specific and data-driven (include numbers, company names, drug names).
                 ),
                 description="Executive summary"
             )
-            return response.content[0].text.strip()
+            return first_text(response).strip()
         except Exception as e:
             logger.error(f"  Summary generation failed: {e}")
             return ""

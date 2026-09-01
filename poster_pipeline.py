@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # Load credentials and shared auth
 from pipeline_security import validate_path, validate_output_path, check_excel_safe, sanitize_filename
 from auth import get_anthropic_client as _get_shared_client
+from anthropic_helpers import first_text
 
 
 class PosterPipeline:
@@ -680,7 +681,7 @@ Output ONLY the corrected, clean text in proper reading order. No commentary or 
                 }]
             )
 
-            enhanced_text = message.content[0].text
+            enhanced_text = first_text(message)
 
             # Calculate enhancement metrics
             char_diff = len(enhanced_text) - len(reference_text)
@@ -840,7 +841,7 @@ Be specific about section names as they appear on the poster (e.g., "BACKGROUND"
                 }]
             )
 
-            response_text = message.content[0].text
+            response_text = first_text(message)
             structure = self.parse_json_response(response_text)
 
             if structure:
@@ -1022,7 +1023,7 @@ IMPORTANT: For each figure, also extract its complete caption text (usually foun
                 }]
             )
 
-            response_text = message.content[0].text
+            response_text = first_text(message)
             logger.info(f"✓ Received analysis from Claude")
             logger.info(f"Input tokens: {message.usage.input_tokens}, Output tokens: {message.usage.output_tokens}")
 
@@ -1135,7 +1136,7 @@ Be specific and quantitative where possible."""
                 }]
             )
 
-            detailed_analysis = message.content[0].text
+            detailed_analysis = first_text(message)
             figure['detailed_analysis'] = detailed_analysis
             logger.info(f"    ✓ Added detailed analysis ({len(detailed_analysis)} chars)")
 
@@ -1208,7 +1209,7 @@ Figure [number]: [brief description]
                 }]
             )
 
-            result_text = response.content[0].text
+            result_text = first_text(response)
             logger.info(f"Fallback detection response: {result_text[:500]}")
 
             # Parse response for figures
@@ -1398,7 +1399,7 @@ Extract ONLY the caption text that describes what the figure shows, not the figu
 
             # Parse response into caption dictionary
             captions = {}
-            caption_text = response.content[0].text
+            caption_text = first_text(response)
 
             # Match "Figure X: caption" patterns
             caption_pattern = re.compile(r'Figure\s+(\d+|[A-Z]):\s*(.+?)(?=\nFigure|\Z)', re.IGNORECASE | re.DOTALL)
@@ -1504,7 +1505,7 @@ Be specific about section names as they appear on the poster (e.g., "BACKGROUND"
             )
 
             # Parse JSON response
-            structure_data = self.parse_json_response(response.content[0].text)
+            structure_data = self.parse_json_response(first_text(response))
 
             if structure_data:
                 layout = structure_data.get('layout_type', 'unknown')
@@ -1613,6 +1614,14 @@ Be specific about section names as they appear on the poster (e.g., "BACKGROUND"
 
                 # Clean up caption: remove excessive whitespace, limit to reasonable length
                 caption = re.sub(r'\s+', ' ', caption)  # Normalize whitespace
+
+                # Strip OCR delimiter artifacts that leak through when the poster
+                # uses `Figure N: // ... **` style headers and the //** boundary
+                # regex doesn't match cleanly. Leading `//`, `///` and trailing
+                # `**`/`***` are template artifacts, not part of the caption.
+                caption = re.sub(r'^/+\s*', '', caption)
+                caption = re.sub(r'\s*\*+\s*$', '', caption)
+                caption = caption.strip()
 
                 # Take first 500 chars if caption is too long (while preserving sentence boundaries)
                 if len(caption) > 500:
@@ -1801,7 +1810,7 @@ Extracted text:
                 messages=[{"role": "user", "content": prompt}]
             )
 
-            result_text = response.content[0].text.strip()
+            result_text = first_text(response).strip()
 
             # Parse JSON response
             import json
@@ -2224,7 +2233,7 @@ Output format:
                 messages=[{"role": "user", "content": prompt}]
             )
 
-            response = message.content[0].text
+            response = first_text(message)
             logger.info(f"Sections + summary: {len(response)} chars "
                        f"(in:{message.usage.input_tokens}, out:{message.usage.output_tokens})")
 

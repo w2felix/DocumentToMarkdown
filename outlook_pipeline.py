@@ -22,6 +22,8 @@ from typing import List, Dict, Optional, Tuple, Set
 from datetime import datetime
 from collections import defaultdict
 
+from anthropic_helpers import first_text
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -863,7 +865,7 @@ class OutlookPipeline:
                 messages=[{"role": "user", "content": content}]
             )
 
-            extracted = response.content[0].text
+            extracted = first_text(response)
             output_path = thread_dir / output_name
 
             md_content = f"---\ntitle: \"{self._escape_yaml(file_path.stem)}\"\n"

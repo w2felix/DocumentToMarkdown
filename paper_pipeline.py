@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 from pipeline_security import validate_path, validate_output_path, sanitize_filename
 from auth import get_anthropic_client as _get_shared_client
+from anthropic_helpers import first_text
 
 
 class PaperPipeline:
@@ -745,7 +746,7 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
                     ]
                 }]
             )
-            result = self.parse_json_response(response.content[0].text)
+            result = self.parse_json_response(first_text(response))
             if result:
                 return {k: v for k, v in result.items() if v is not None}
         except Exception as e:
@@ -936,7 +937,7 @@ Paper text:
                 max_tokens=8192,
                 messages=[{"role": "user", "content": prompt}]
             )
-            result = self.parse_json_response(response.content[0].text)
+            result = self.parse_json_response(first_text(response))
             if result:
                 return {k: v for k, v in result.items() if v and len(str(v)) > 50}
         except Exception as e:
@@ -1070,7 +1071,7 @@ Return ONLY the JSON array."""
                     max_tokens=4096,
                     messages=[{"role": "user", "content": content_blocks}]
                 )
-                result = self.parse_json_response(response.content[0].text)
+                result = self.parse_json_response(first_text(response))
                 items = result if isinstance(result, list) else [result] if isinstance(result, dict) else []
                 for idx, item in enumerate(items):
                     item.setdefault('relevance', 'MEDIUM')
@@ -1178,7 +1179,7 @@ Write a concise summary highlighting the main finding, method, and significance.
                 max_tokens=512,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return response.content[0].text.strip()
+            return first_text(response).strip()
         except Exception as e:
             logger.error(f"Executive summary generation failed: {e}")
             return ""

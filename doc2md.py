@@ -89,11 +89,20 @@ def classify_document(pdf_path) -> str:
 
 
 def extract_text(pdf_path, *, max_vision_pages: int = 8,
-                 budget: int = 50) -> ExtractionResult:
+                 budget: int = 50,
+                 poster_options: dict | None = None) -> ExtractionResult:
     """Extract full text and structure from a PDF or PPTX.
 
     Routes to appropriate pipeline (paper/poster/talk/presentation) based on
     file type and classification. Returns structured data without writing to disk.
+
+    poster_options: optional dict forwarded to the poster pipeline. Recognized
+        keys:
+          - enable_detailed_analysis (bool, default True): when False, skips
+            Stage 2 per-figure detailed analysis. ~60% faster; figure blocks
+            still get Stage 1 identification with Caption/Description/Key
+            Findings but no Detailed Analysis.
+        Ignored for non-poster inputs.
     """
     pdf_path = Path(pdf_path)
 
@@ -106,7 +115,7 @@ def extract_text(pdf_path, *, max_vision_pages: int = 8,
     if doc_type == 'paper' or doc_type == 'patent':
         return _extract_with_paper_pipeline(pdf_path, max_vision_pages, budget)
     elif doc_type == 'poster':
-        return _extract_with_poster_pipeline(pdf_path, budget)
+        return _extract_with_poster_pipeline(pdf_path, budget, poster_options or {})
     elif doc_type == 'talk':
         return _extract_with_talk_pipeline(pdf_path, budget)
     else:
@@ -240,8 +249,12 @@ def _extract_with_paper_pipeline(pdf_path: Path, max_vision_pages: int,
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _extract_with_poster_pipeline(pdf_path: Path, budget: int) -> ExtractionResult:
+def _extract_with_poster_pipeline(pdf_path: Path, budget: int,
+                                  options: dict | None = None) -> ExtractionResult:
     from poster_pipeline import PosterPipeline
+
+    options = options or {}
+    enable_detailed = bool(options.get("enable_detailed_analysis", True))
 
     with tempfile.TemporaryDirectory(prefix="doc2md_poster_") as tmpdir:
         pipeline = PosterPipeline(
@@ -249,7 +262,11 @@ def _extract_with_poster_pipeline(pdf_path: Path, budget: int) -> ExtractionResu
             output_dir=tmpdir,
             naming='default',
         )
-        success = pipeline.process_single_poster(pdf_path, skip_existing=False)
+        success = pipeline.process_single_poster(
+            pdf_path,
+            skip_existing=False,
+            enable_detailed_analysis=enable_detailed,
+        )
         if success:
             output_files = list(Path(tmpdir).glob("*.md"))
             if output_files:

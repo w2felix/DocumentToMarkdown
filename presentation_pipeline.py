@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Load credentials and shared auth
 from pipeline_security import validate_path, validate_output_path, check_pptx_safe, sanitize_filename
 from auth import get_anthropic_client as _get_shared_client
+from anthropic_helpers import first_text
 
 
 class PresentationPipeline:
@@ -724,7 +725,7 @@ Return ONLY valid JSON."""
                 ),
                 description="Vision batch extraction"
             )
-            results = self.parse_json_response(response.content[0].text)
+            results = self.parse_json_response(first_text(response))
             if isinstance(results, list):
                 slides = []
                 for item in results:
@@ -856,7 +857,7 @@ Return ONLY valid JSON."""
                 ),
                 description="Image enrichment batch"
             )
-            results = self.parse_json_response(response.content[0].text)
+            results = self.parse_json_response(first_text(response))
             if isinstance(results, list):
                 output = {}
                 num_to_idx = {slide_idx + 1: slide_idx for slide_idx in slide_indices}
@@ -1040,7 +1041,7 @@ Return ONLY valid JSON."""
                 ),
                 description="Vision analysis"
             )
-            result = self.parse_json_response(response.content[0].text)
+            result = self.parse_json_response(first_text(response))
             if isinstance(result, dict):
                 figures = result.get('figures', [])
                 chem_structures = [f for f in figures
@@ -1230,7 +1231,7 @@ Return ONLY valid JSON."""
                     ),
                     description=f"SMILES refinement ({label})"
                 )
-                result = self.parse_json_response(response.content[0].text)
+                result = self.parse_json_response(first_text(response))
                 if result and result.get('smiles') and self.validate_smiles(result['smiles']):
                     struct['smiles'] = result['smiles']
                     struct['smiles_confidence'] = result.get('smiles_confidence', 'medium')
@@ -1347,7 +1348,7 @@ Format your response as:
                 ),
                 description="Summary generation"
             )
-            text = response.content[0].text
+            text = first_text(response)
 
             summary = ''
             takeaways = ''
