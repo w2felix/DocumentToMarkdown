@@ -909,14 +909,15 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
         """
         try:
             import crossref_meta as _cr
-        except Exception:
+        except Exception as e:
+            logger.debug(f"  crossref_meta unavailable, skipping reconciliation: {e}")
             return
 
         def _title_lookup() -> Optional[dict]:
-            title = (merged.get('title') or '').lstrip('#').strip()
+            title = _cr.sanitize_title(merged.get('title') or '')
             if not title or title.lower() == 'untitled':
-                title = filename_meta.get('title_hint') or ''
-                title = title.replace('-', ' ').strip()
+                hint = (filename_meta.get('title_hint') or '').replace('-', ' ')
+                title = _cr.sanitize_title(hint)
             if not title:
                 return None
             first = merged.get('first_author') or filename_meta.get('first_author')
@@ -928,6 +929,20 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
                 return _cr.fetch_by_doi(resolved)
             return None
 
+        def _family_matches(cr_family: str, fname_author: str) -> bool:
+            """Return True if the Crossref family name plausibly matches the
+            filename first-author. Handles hyphenated / double-barreled names
+            (e.g. filename 'Smith', crossref 'Smith-Jones') and case."""
+            if not cr_family or not fname_author:
+                return True  # nothing to compare
+            a = cr_family.lower()
+            b = fname_author.lower()
+            if a == b:
+                return True
+            a_tokens = set(re.split(r"[-\s']+", a)) - {""}
+            b_tokens = set(re.split(r"[-\s']+", b)) - {""}
+            return bool(a_tokens & b_tokens)
+
         try:
             doi = merged.get('doi')
             record = _cr.fetch_by_doi(doi) if doi else None
@@ -935,15 +950,15 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
             # Sanity check: if filename encodes a first-author surname and
             # Crossref returned a different family, the DOI is probably from
             # a paper *cited* on page 1, not this paper. Try the title path.
-            fname_author = (filename_meta.get('first_author') or '').lower()
+            fname_author = filename_meta.get('first_author') or ''
             if record and fname_author:
                 cr_first = next(
                     (a for a in record.get('authors', [])
                      if a.get('sequence') == 'first'),
                     None,
                 ) or (record.get('authors') or [None])[0]
-                cr_family = ((cr_first or {}).get('family') or '').lower()
-                if cr_family and cr_family != fname_author:
+                cr_family = ((cr_first or {}).get('family') or '')
+                if cr_family and not _family_matches(cr_family, fname_author):
                     logger.info(
                         f"  Crossref: DOI first-author '{cr_family}' does not "
                         f"match filename '{fname_author}', retrying via title"
@@ -972,7 +987,7 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
             if overrides.get('first_author'):
                 merged['first_author'] = overrides['first_author']
             merged['_crossref_verified'] = True
-            logger.info(
+            logger.debug(
                 f"  Crossref: canonical metadata applied "
                 f"(doi={merged.get('doi')}, authors={len(merged.get('authors') or [])})"
             )

@@ -31,7 +31,15 @@ _CACHE_TTL_S = 7 * 24 * 3600
 _HTTP_TIMEOUT_S = 8.0
 _USER_AGENT = "DocumentToMarkdown/1.0 (mailto:felix.geist@merckgroup.com)"
 
-_DOI_CLEAN = re.compile(r"[^A-Za-z0-9._/\-]")
+# Allowed in cache slugs. Note `/` is NOT included: DOIs contain a slash
+# between registrant and suffix, and we want a single file per DOI, not a
+# nested subdirectory tree.
+_DOI_CLEAN = re.compile(r"[^A-Za-z0-9._\-]")
+
+# Markdown formatting + Unicode replacement char that pdf-inspector sometimes
+# leaves in titles when the source PDF has encoding issues.
+_TITLE_CRUFT = re.compile(r"[\*_`#�]+")
+_TITLE_MIN_CHARS = 10
 
 
 def _cache_path(doi: str) -> Path:
@@ -151,6 +159,21 @@ def fetch_by_doi(doi: str) -> Optional[dict]:
         return None
 
 
+def sanitize_title(title: str) -> str:
+    """Strip markdown formatting and encoding artefacts from a raw title.
+
+    pdf-inspector's markdown output can leave leading ``#``, wrapping ``*``,
+    or ``\\uFFFD`` replacement chars when the source PDF has font encoding
+    issues. Crossref's bibliographic search tolerates punctuation but the
+    Jaccard cross-check downstream punishes garbage tokens, so it pays to
+    clean up once at the boundary.
+    """
+    if not title:
+        return ""
+    cleaned = _TITLE_CRUFT.sub(" ", title)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def resolve_doi_by_title(title: str,
                          first_author: Optional[str] = None) -> Optional[str]:
     """Best-effort title -> DOI resolution when no DOI was extracted.
@@ -159,7 +182,10 @@ def resolve_doi_by_title(title: str,
     close string match to the query title (>=0.75 Jaccard on word sets)
     to avoid returning a wrong paper.
     """
-    if not title or len(title) < 15:
+    title = sanitize_title(title or "")
+    if len(title) < _TITLE_MIN_CHARS:
+        if title:
+            logger.debug(f"Crossref title lookup skipped: too short ({title!r})")
         return None
     try:
         import requests

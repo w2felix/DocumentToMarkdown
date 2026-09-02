@@ -30,14 +30,6 @@ class FrontendResult:
     pages_needing_ocr: list[int] = field(default_factory=list)
 
 
-def is_available() -> bool:
-    try:
-        import pdf_inspector  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
 def extract_pages(pdf_path: str | Path) -> FrontendResult:
     """Run pdf-inspector on ``pdf_path`` and shape the result.
 
@@ -64,11 +56,12 @@ def extract_pages(pdf_path: str | Path) -> FrontendResult:
     page_data.sort(key=lambda p: p["page_num"])
     ocr_pages = sorted(set(ocr_pages))
 
+    # pages_needing_ocr is exposed as a top-level field on FrontendResult;
+    # doc_flags keeps only the metadata that has no dedicated field.
     doc_flags = {
         "is_complex_layout": bool(getattr(result, "is_complex", False)),
         "pages_with_columns": list(getattr(result, "pages_with_columns", []) or []),
         "pages_with_tables": list(getattr(result, "pages_with_tables", []) or []),
-        "pages_needing_ocr": list(getattr(result, "pages_needing_ocr", []) or []),
         "ocr_reasons_by_page": {
             int(r.page): list(r.reasons)
             for r in (getattr(result, "ocr_reasons_by_page", []) or [])
