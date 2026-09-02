@@ -304,34 +304,11 @@ class PatentPipeline:
             return None, None
 
     def render_pages_to_images(self, pdf_path: Path, page_numbers: List[int], dpi: int = None) -> Dict[int, Any]:
-        """Render multiple pages from a single PDF open — avoids repeated open/close."""
+        """Render multiple pages via the shared pdf_utils primitive."""
         if dpi is None:
             dpi = self.RENDER_DPI
-        images = {}
-        try:
-            import fitz
-            from PIL import Image
-            Image.MAX_IMAGE_PIXELS = 300_000_000
-            doc = fitz.open(str(pdf_path))
-            try:
-                zoom = dpi / 72
-                mat = fitz.Matrix(zoom, zoom)
-                for page_num in page_numbers:
-                    if page_num < len(doc):
-                        pix = doc[page_num].get_pixmap(matrix=mat)
-                        images[page_num] = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            finally:
-                doc.close()
-        except Exception as e:
-            logger.error(f"Error rendering pages: {e}")
-            # Clean up any partial images on error
-            for img in images.values():
-                try:
-                    img.close()
-                except Exception:
-                    pass
-            images.clear()
-        return images
+        import pdf_utils
+        return pdf_utils.render_pages(pdf_path, page_indices=page_numbers, dpi=dpi)
 
     def parse_json_response(self, response_text: str) -> Optional[Any]:
         try:
@@ -735,24 +712,22 @@ Start with ===PAGE {page_numbers[0] + 1}==="""
     # ─── Stage 0: PDF Characterization & Page Classification ───────────────
 
     def characterize_pdf(self, pdf_path: Path) -> Dict:
-        import pdfplumber
+        import pdf_utils
 
         logger.info("Stage 0: Characterizing PDF and classifying pages...")
-        pdf = pdfplumber.open(str(pdf_path))
-        total_pages = len(pdf.pages)
+        pages = pdf_utils.extract_text_pages(pdf_path)
+        total_pages = len(pages) or pdf_utils.page_count(pdf_path)
         logger.info(f"  Total pages: {total_pages}")
 
         page_data = []
         for i in range(total_pages):
-            text = pdf.pages[i].extract_text() or ""
+            text = pages[i].text if i < len(pages) else ""
             page_data.append({
                 'page_num': i,
                 'text': text,
                 'text_length': len(text),
                 'classification': self._classify_page(text, i, total_pages)
             })
-
-        pdf.close()
 
         classifications = {}
         for pd_item in page_data:
@@ -948,8 +923,9 @@ Return ONLY a JSON array like: [{{"page": 55, "type": "text"}}, {{"page": 111, "
                                    text_page_indices: List[int]) -> int:
         """OCR text pages from scanned PDF using local Tesseract (free, fast).
 
-        Renders pages in batches at 200 DPI via PyMuPDF, runs pytesseract per page.
-        Processes all pages — no budget constraint since it's free.
+        Renders pages via pdf_utils.render_pages, then runs pytesseract per page
+        with TESSERACT_CONFIG (--psm/--oem knobs, which pdf_utils.ocr_pages does
+        not expose). Processes all pages — no budget constraint since it's free.
         """
         import pytesseract
 

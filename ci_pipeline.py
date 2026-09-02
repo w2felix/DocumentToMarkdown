@@ -318,19 +318,19 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
 
     def extract_pdf_content(self, pdf_path: Path) -> Dict:
         """Extract text and tables from a PDF."""
-        import fitz
+        import pdf_utils
         import pdfplumber
 
         pages = []
         total_chars = 0
+        num_pages = 0
 
         try:
-            doc = fitz.open(str(pdf_path))
-            num_pages = len(doc)
+            text_pages = pdf_utils.extract_text_pages(pdf_path)
+            num_pages = len(text_pages) or pdf_utils.page_count(pdf_path)
 
             for page_idx in range(num_pages):
-                page = doc[page_idx]
-                text = page.get_text()
+                text = text_pages[page_idx].text if page_idx < len(text_pages) else ""
                 char_count = len(text.strip())
                 total_chars += char_count
                 pages.append({
@@ -340,9 +340,7 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
                     'tables': [],
                 })
 
-            doc.close()
-
-            # Table extraction with pdfplumber
+            # Table extraction with pdfplumber (not wrapped by pdf_utils)
             with pdfplumber.open(str(pdf_path)) as pdf:
                 for page_idx, page in enumerate(pdf.pages):
                     extracted_tables = page.extract_tables()

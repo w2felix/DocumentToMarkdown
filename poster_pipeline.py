@@ -341,63 +341,38 @@ class PosterPipeline:
         return any(f.endswith(suffix) for f in self._existing_files)
 
     def extract_text_native(self, pdf_path: Path) -> Tuple[Optional[str], str]:
-        """Extract text using native PDF text extraction"""
+        """Extract text using native PDF text extraction."""
         try:
-            import pdfplumber
-            text = ""
-            with pdfplumber.open(pdf_path) as pdf:
-                logger.info(f"PDF has {len(pdf.pages)} page(s)")
-                for page_num, page in enumerate(pdf.pages):
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n\n"
-                        logger.debug(f"Page {page_num+1}: extracted {len(page_text)} chars")
-
+            import pdf_utils
+            pages = pdf_utils.extract_text_pages(pdf_path)
+            if not pages:
+                return None, "error"
+            logger.info(f"PDF has {len(pages)} page(s)")
+            text = "\n\n".join(p.text for p in pages if p.text) + ("\n\n" if pages else "")
             logger.info(f"Total extracted: {len(text)} characters, {len(text.split())} words")
-
             if self.is_readable_text(text):
-                logger.info(f"✓ Native text extraction successful")
+                logger.info("✓ Native text extraction successful")
                 return text, "native"
-            else:
-                logger.warning(f"✗ Text quality check failed - may need OCR")
-                return text, "native_low_quality"
-
-        except ImportError:
-            logger.error("pdfplumber not installed")
-            return None, "error"
+            logger.warning("✗ Text quality check failed - may need OCR")
+            return text, "native_low_quality"
         except Exception as e:
             logger.error(f"Error extracting text: {e}")
             return None, "error"
 
     def extract_text_ocr(self, pdf_path: Path, dpi: int = 200) -> Tuple[Optional[str], str]:
-        """Extract text using OCR (fallback for scanned PDFs)"""
+        """Extract text using OCR (fallback for scanned PDFs)."""
         try:
-            from pdf2image import convert_from_path
-            import pytesseract
-            from PIL import Image
-
-            Image.MAX_IMAGE_PIXELS = 300_000_000
+            import pdf_utils
             logger.info(f"Running OCR at {dpi} DPI...")
-
-            images = convert_from_path(str(pdf_path), dpi=dpi)
-            logger.info(f"Converted to {len(images)} image(s)")
-
-            text = ""
-            for i, image in enumerate(images):
-                width, height = image.size
-                megapixels = (width * height) / 1_000_000
-                logger.info(f"Processing page {i+1}/{len(images)} ({width}x{height}, {megapixels:.1f}MP)")
-
-                page_text = pytesseract.image_to_string(image)
-                text += page_text + "\n\n"
-                logger.info(f"  Extracted {len(page_text)} characters from page {i+1}")
-
+            results = pdf_utils.ocr_pages(pdf_path, dpi=dpi)
+            if not results:
+                logger.error("OCR returned no pages")
+                return None, "error"
+            for r in results:
+                logger.info(f"  Page {r.page_num + 1}: {r.char_count} chars")
+            text = "\n\n".join(r.text for r in results) + "\n\n"
             logger.info(f"OCR extraction complete: {len(text)} chars, {len(text.split())} words")
             return text, "ocr"
-
-        except ImportError:
-            logger.error("OCR libraries not installed")
-            return None, "error"
         except Exception as e:
             logger.error(f"Error during OCR: {e}")
             return None, "error"
@@ -444,85 +419,32 @@ class PosterPipeline:
         return True
 
     def convert_pdf_to_image(self, pdf_path: Path, dpi: int = 300, page_num: int = 0):
-        """Convert PDF page to high-resolution image for Vision API
-
-        Args:
-            pdf_path: Path to PDF file
-            dpi: Resolution for conversion (default 300)
-            page_num: Page number to convert (0-indexed, default 0)
-
-        Returns:
-            PIL Image or None
-        """
-        try:
-            import fitz  # PyMuPDF
-            from PIL import Image
-
-            Image.MAX_IMAGE_PIXELS = 300_000_000
-
-            doc = fitz.open(str(pdf_path))
-            if len(doc) == 0:
-                return None
-
-            if page_num >= len(doc):
-                logger.error(f"Page {page_num} does not exist (PDF has {len(doc)} pages)")
-                return None
-
-            page = doc[page_num]
-            zoom = dpi / 72
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-
-            page_image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-            megapixels = (pix.width * pix.height) / 1_000_000
-            logger.info(f"✓ Converted page {page_num+1} to {pix.width}x{pix.height} ({megapixels:.1f}MP) at {dpi} DPI")
-
-            doc.close()
-            return page_image
-
-        except Exception as e:
-            logger.error(f"Error converting PDF to image: {e}")
+        """Convert a single PDF page to high-resolution image for Vision API."""
+        import pdf_utils
+        images = pdf_utils.render_pages(pdf_path, page_indices=[page_num], dpi=dpi)
+        img = images.get(page_num)
+        if img is None:
+            logger.error(f"Failed to render page {page_num}")
             return None
+        mp = (img.width * img.height) / 1_000_000
+        logger.info(
+            f"✓ Converted page {page_num + 1} to {img.width}x{img.height} "
+            f"({mp:.1f}MP) at {dpi} DPI"
+        )
+        return img
 
     def convert_pdf_to_images_all_pages(self, pdf_path: Path, dpi: int = 300) -> List[Any]:
-        """Convert all PDF pages to images
-
-        Args:
-            pdf_path: Path to PDF file
-            dpi: Resolution for conversion
-
-        Returns:
-            List of PIL Images
-        """
-        try:
-            import fitz  # PyMuPDF
-            from PIL import Image
-
-            Image.MAX_IMAGE_PIXELS = 300_000_000
-
-            doc = fitz.open(str(pdf_path))
-            num_pages = len(doc)
-            logger.info(f"Converting all {num_pages} pages to images at {dpi} DPI...")
-
-            images = []
-            zoom = dpi / 72
-            mat = fitz.Matrix(zoom, zoom)
-
-            for page_num in range(num_pages):
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=mat)
-                page_image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(page_image)
-                logger.info(f"  Page {page_num + 1}/{num_pages}: {pix.width}x{pix.height}")
-
-            doc.close()
-            logger.info(f"✓ Converted {len(images)} pages")
-            return images
-
-        except Exception as e:
-            logger.error(f"Error converting PDF pages to images: {e}")
+        """Convert all PDF pages to images."""
+        import pdf_utils
+        images_dict = pdf_utils.render_pages(pdf_path, dpi=dpi)
+        if not images_dict:
+            logger.error("Error converting PDF pages to images")
             return []
+        images = [images_dict[k] for k in sorted(images_dict)]
+        for i, img in enumerate(images):
+            logger.info(f"  Page {i + 1}/{len(images)}: {img.width}x{img.height}")
+        logger.info(f"✓ Converted {len(images)} pages")
+        return images
 
     def remove_template_artifacts(self, text: str) -> str:
         """Remove common poster template instructions and artifacts

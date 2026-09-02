@@ -205,35 +205,18 @@ class TalkPipeline:
 
     def convert_pdf_to_slide_images(self, pdf_path: Path) -> List[Any]:
         """Convert all pages of a talk PDF to PIL images."""
-        try:
-            import fitz
-            from PIL import Image
+        import pdf_utils
 
-            Image.MAX_IMAGE_PIXELS = 300_000_000
-            doc = fitz.open(str(pdf_path))
-            try:
-                num_pages = len(doc)
-                logger.info(f"Converting {num_pages} slides at {self.RENDER_DPI} DPI...")
+        num_pages = pdf_utils.page_count(pdf_path)
+        logger.info(f"Converting {num_pages} slides at {self.RENDER_DPI} DPI...")
 
-                images = []
-                zoom = self.RENDER_DPI / 72
-                mat = fitz.Matrix(zoom, zoom)
-
-                for page_num in range(num_pages):
-                    page = doc[page_num]
-                    pix = page.get_pixmap(matrix=mat)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    images.append(img)
-            finally:
-                doc.close()
-
-            if images:
-                logger.info(f"Converted {len(images)} slides ({images[0].size[0]}x{images[0].size[1]} px)")
-            return images
-
-        except Exception as e:
-            logger.error(f"Error converting PDF to images: {e}")
+        rendered = pdf_utils.render_pages(pdf_path, dpi=self.RENDER_DPI)
+        if not rendered:
             return []
+        images = [rendered[i] for i in sorted(rendered.keys())]
+        if images:
+            logger.info(f"Converted {len(images)} slides ({images[0].size[0]}x{images[0].size[1]} px)")
+        return images
 
     def ocr_slide_images(self, slide_images: List[Any]) -> List[str]:
         """Run OCR on each slide image to extract text as RAG context for Vision AI."""

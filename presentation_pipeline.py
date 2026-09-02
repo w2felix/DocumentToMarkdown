@@ -398,6 +398,10 @@ class PresentationPipeline:
         }
 
     def extract_pdf_content(self, pdf_path: Path) -> Dict:
+        # NOTE: This function uses fitz's get_text('dict') layout output for
+        # per-line direction vectors (rotated axis labels) and structured span
+        # extraction, which pdf_utils does not expose. Keep the direct fitz
+        # call here; pdfplumber remains the table extractor.
         import fitz
         import pdfplumber
 
@@ -536,27 +540,11 @@ class PresentationPipeline:
         return all_slides
 
     def _convert_pdf_to_images(self, pdf_path: Path) -> List[Any]:
-        try:
-            import fitz
-            from PIL import Image
-
-            Image.MAX_IMAGE_PIXELS = 300_000_000  # ~300MP, generous but bounded
-            doc = fitz.open(str(pdf_path))
-            images = []
-            zoom = self.RENDER_DPI / 72
-            mat = fitz.Matrix(zoom, zoom)
-
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=mat)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
-
-            doc.close()
-            return images
-        except Exception as e:
-            logger.error(f"Error converting PDF to images: {e}")
+        import pdf_utils
+        rendered = pdf_utils.render_pages(pdf_path, dpi=self.RENDER_DPI)
+        if not rendered:
             return []
+        return [rendered[i] for i in sorted(rendered.keys())]
 
     def _filter_chart_axis_data(self, lines: List[str]) -> List[str]:
         """Remove sequences of pure-numeric lines that are chart axis tick marks."""

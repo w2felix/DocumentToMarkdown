@@ -173,32 +173,10 @@ class PaperPipeline:
 
     def render_pages_to_images(self, pdf_path: Path, page_numbers: List[int],
                                dpi: int = None) -> Dict[int, Any]:
+        import pdf_utils
         if dpi is None:
             dpi = self.RENDER_DPI
-        images = {}
-        try:
-            import fitz
-            from PIL import Image
-            Image.MAX_IMAGE_PIXELS = 300_000_000
-            doc = fitz.open(str(pdf_path))
-            try:
-                zoom = dpi / 72
-                mat = fitz.Matrix(zoom, zoom)
-                for page_num in page_numbers:
-                    if page_num < len(doc):
-                        pix = doc[page_num].get_pixmap(matrix=mat)
-                        images[page_num] = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            finally:
-                doc.close()
-        except Exception as e:
-            logger.error(f"Error rendering pages: {e}")
-            for img in images.values():
-                try:
-                    img.close()
-                except Exception:
-                    pass
-            images.clear()
-        return images
+        return pdf_utils.render_pages(pdf_path, page_indices=page_numbers, dpi=dpi)
 
     def encode_image_to_base64(self, image, format="JPEG",
                                max_dimension=None, quality: int = 85) -> Tuple[Optional[str], Optional[str]]:
@@ -491,40 +469,21 @@ class PaperPipeline:
         Returns a page_data list restricted to the OCR'd pages, with the
         same shape ``characterize_pdf`` produces. Returns ``None`` on error.
         """
-        try:
-            import fitz
-            from PIL import Image
-            import pytesseract
-            Image.MAX_IMAGE_PIXELS = 300_000_000
-
-            page_data = []
-            doc = fitz.open(str(pdf_path))
-            try:
-                total_pages = len(doc)
-                indices = (list(range(total_pages))
-                           if page_indices is None
-                           else [i for i in page_indices if 0 <= i < total_pages])
-                zoom = self.DEFAULT_OCR_DPI / 72
-                mat = fitz.Matrix(zoom, zoom)
-                for i in indices:
-                    pix = doc[i].get_pixmap(matrix=mat)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    text = pytesseract.image_to_string(img)
-                    char_count = len(text.strip())
-                    classification = self._classify_page(text, i, total_pages)
-                    page_data.append({
-                        'page_num': i,
-                        'text': text,
-                        'char_count': char_count,
-                        'classification': classification,
-                    })
-                    img.close()
-            finally:
-                doc.close()
-            return page_data if page_data else None
-        except Exception as e:
-            logger.error(f"OCR failed: {e}")
+        import pdf_utils
+        total_pages = pdf_utils.page_count(pdf_path) or 0
+        if not total_pages:
             return None
+        ocr_results = pdf_utils.ocr_pages(
+            pdf_path, page_indices=page_indices, dpi=self.DEFAULT_OCR_DPI)
+        if not ocr_results:
+            return None
+        page_data = [{
+            'page_num': r.page_num,
+            'text': r.text,
+            'char_count': r.char_count,
+            'classification': self._classify_page(r.text, r.page_num, total_pages),
+        } for r in ocr_results]
+        return page_data or None
 
     def _ocr_all_pages(self, pdf_path: Path) -> Optional[List[Dict]]:
         """OCR every page."""

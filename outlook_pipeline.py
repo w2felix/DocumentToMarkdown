@@ -786,20 +786,22 @@ class OutlookPipeline:
     def _classify_pdf(self, file_path: Path) -> str:
         """Classify a PDF as 'paper' (multi-page text), 'poster' (single-page visual), or 'visual'."""
         try:
-            import fitz
-            doc = fitz.open(str(file_path))
-            page_count = len(doc)
+            import pdf_utils
+
+            page_count = pdf_utils.page_count(file_path)
             if page_count == 0:
-                doc.close()
                 return 'paper'
 
-            # Check text density of first page
-            first_page = doc[0]
-            text = first_page.get_text()
+            # First-page text via the shared primitive.
+            first_pages = pdf_utils.extract_text_pages(file_path, max_pages=1)
+            text = first_pages[0].text if first_pages else ""
             text_chars = len(text.strip())
-            images = first_page.get_images()
 
-            doc.close()
+            # get_images() (embedded image XObject list) is fitz-specific and
+            # not exposed by pdf_utils, so keep a slim fitz call for that only.
+            import fitz
+            with fitz.open(str(file_path)) as doc:
+                images = doc[0].get_images() if len(doc) > 0 else []
 
             # Single page with few text chars → visual/poster (needs vision AI)
             if page_count <= 2 and text_chars < 500 and len(images) > 0:
@@ -826,17 +828,21 @@ class OutlookPipeline:
                                  output_name: str) -> Optional[str]:
         """Process a visual/poster-style PDF using direct vision AI extraction."""
         try:
-            import fitz
             import base64
+            from io import BytesIO
+            import pdf_utils
             from auth import get_anthropic_client
 
-            doc = fitz.open(str(file_path))
+            rendered = pdf_utils.render_pages(file_path, dpi=100)
             images_b64 = []
-            for page in doc:
-                pix = page.get_pixmap(dpi=100)
-                img_bytes = pix.tobytes("png")
-                images_b64.append(base64.standard_b64encode(img_bytes).decode())
-            doc.close()
+            for i in sorted(rendered.keys()):
+                buf = BytesIO()
+                rendered[i].save(buf, format="PNG")
+                images_b64.append(base64.standard_b64encode(buf.getvalue()).decode())
+                try:
+                    rendered[i].close()
+                except Exception:
+                    pass
 
             if not images_b64:
                 return None
