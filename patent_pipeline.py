@@ -923,11 +923,11 @@ Return ONLY a JSON array like: [{{"page": 55, "type": "text"}}, {{"page": 111, "
                                    text_page_indices: List[int]) -> int:
         """OCR text pages from scanned PDF using local Tesseract (free, fast).
 
-        Renders pages via pdf_utils.render_pages, then runs pytesseract per page
-        with TESSERACT_CONFIG (--psm/--oem knobs, which pdf_utils.ocr_pages does
-        not expose). Processes all pages — no budget constraint since it's free.
+        Delegates rendering + Tesseract invocation to pdf_utils.ocr_pages
+        (with the patent-specific ``--psm 6 --oem 1`` config). Applies
+        clean_patent_text post-processing and updates page_data in place.
         """
-        import pytesseract
+        import pdf_utils
 
         logger.info(f"  Tesseract OCR: processing {len(text_page_indices)} pages "
                    f"(batch size {self.TESSERACT_BATCH_SIZE}, {self.TESSERACT_DPI} DPI)...")
@@ -937,24 +937,18 @@ Return ONLY a JSON array like: [{{"page": 55, "type": "text"}}, {{"page": 111, "
 
         for batch_num, batch_start in enumerate(range(0, len(text_page_indices), self.TESSERACT_BATCH_SIZE)):
             batch_indices = text_page_indices[batch_start:batch_start + self.TESSERACT_BATCH_SIZE]
-            images = self.render_pages_to_images(pdf_path, batch_indices, dpi=self.TESSERACT_DPI)
-
-            for page_num in batch_indices:
-                if page_num not in images:
-                    continue
-                try:
-                    text = pytesseract.image_to_string(
-                        images[page_num], config=self.TESSERACT_CONFIG)
-                    text = self.clean_patent_text(text)
-                    if text and len(text.strip()) > self.TESSERACT_MIN_CHARS:
-                        page_data[page_num]['text'] = text
-                        page_data[page_num]['text_length'] = len(text)
-                        page_data[page_num]['classification'] = 'TEXT_HEAVY'
-                        page_data[page_num]['ocr_method'] = 'tesseract'
-                        ocr_count += 1
-                except Exception as e:
-                    logger.debug(f"  Tesseract failed on page {page_num + 1}: {e}")
-                del images[page_num]
+            results = pdf_utils.ocr_pages(
+                pdf_path, page_indices=batch_indices,
+                dpi=self.TESSERACT_DPI, config=self.TESSERACT_CONFIG,
+            )
+            for r in results:
+                text = self.clean_patent_text(r.text)
+                if text and len(text.strip()) > self.TESSERACT_MIN_CHARS:
+                    page_data[r.page_num]['text'] = text
+                    page_data[r.page_num]['text_length'] = len(text)
+                    page_data[r.page_num]['classification'] = 'TEXT_HEAVY'
+                    page_data[r.page_num]['ocr_method'] = 'tesseract'
+                    ocr_count += 1
 
             if (batch_num + 1) % 5 == 0 or batch_num == total_batches - 1:
                 logger.info(f"  Tesseract progress: batch {batch_num + 1}/{total_batches}, "

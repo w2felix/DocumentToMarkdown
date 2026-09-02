@@ -1107,14 +1107,30 @@ Paper text:
     # ─── Figure Analysis ──────────────────────────────────────────────────────
 
     def identify_figure_pages(self, page_data: List[Dict]) -> List[int]:
-        """Identify pages that likely contain figures (low text, or figure captions nearby)."""
+        """Identify pages that likely contain figures (low text, or figure captions nearby).
+
+        Skips pages that pdf-inspector flagged as containing tables when there
+        is no figure caption on the same page: table-only pages are handled by
+        pdfplumber's table extractor and don't need a Vision AI call.
+        """
+        flags = getattr(self, '_last_frontend_flags', None) or {}
+        table_pages = set(flags.get('pages_with_tables') or [])
+
         figure_pages = []
         for p in page_data:
+            page_num = p['page_num']
+            text_head = p['text'].lower()[:200]
+            has_figure_marker = 'figure' in text_head or 'fig.' in text_head
+
+            if page_num in table_pages and not has_figure_marker:
+                logger.debug(f"  Skipping page {page_num + 1} for figure vision: "
+                             f"table-only per pdf-inspector")
+                continue
+
             if p['classification'] == 'FIGURE_PAGE':
-                figure_pages.append(p['page_num'])
-            elif 'figure' in p['text'].lower()[:200] or 'fig.' in p['text'].lower()[:200]:
-                if p['char_count'] < 500:
-                    figure_pages.append(p['page_num'])
+                figure_pages.append(page_num)
+            elif has_figure_marker and p['char_count'] < 500:
+                figure_pages.append(page_num)
 
         return figure_pages[:self.max_vision_pages]
 
@@ -1762,10 +1778,19 @@ Write a concise summary highlighting the main finding, method, and significance.
         filename_meta = self.extract_metadata_from_filename(pdf_path)
         text_meta = self.extract_metadata_from_text(full_text, page_data)
 
-        if no_vision:
-            vision_meta = {}
-        else:
-            vision_meta = self.extract_metadata_vision(pdf_path, page_data)
+        vision_meta = {}
+        if not no_vision:
+            skip = (
+                os.getenv("DOC2MD_SKIP_VISION_METADATA_IF_DOI", "0") == "1"
+                and bool(text_meta.get("doi"))
+            )
+            if skip:
+                logger.info(
+                    "  Skipping vision metadata call: text-extracted DOI present; "
+                    "Crossref will supply canonical title/authors/journal/year."
+                )
+            else:
+                vision_meta = self.extract_metadata_vision(pdf_path, page_data)
 
         metadata = self.merge_metadata(vision_meta, text_meta, filename_meta)
         logger.info(f"  Title: {metadata.get('title', 'Unknown')[:60]}")

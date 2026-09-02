@@ -198,7 +198,16 @@ def _extract_with_paper_pipeline(pdf_path: Path, max_vision_pages: int,
         filename_meta = pipeline.extract_metadata_from_filename(pdf_path)
         text_meta = pipeline.extract_metadata_from_text(full_text, page_data)
         no_vision = (max_vision_pages == 0)
-        vision_meta = {} if no_vision else pipeline.extract_metadata_vision(pdf_path, page_data)
+        import os as _os
+        skip_vision_meta = (
+            not no_vision
+            and _os.getenv("DOC2MD_SKIP_VISION_METADATA_IF_DOI", "0") == "1"
+            and bool(text_meta.get("doi"))
+        )
+        if no_vision or skip_vision_meta:
+            vision_meta = {}
+        else:
+            vision_meta = pipeline.extract_metadata_vision(pdf_path, page_data)
         metadata = pipeline.merge_metadata(vision_meta, text_meta, filename_meta)
 
         # Sections

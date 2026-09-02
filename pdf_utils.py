@@ -248,8 +248,13 @@ def truncate(pdf: PdfSource, max_pages: int, output: Path) -> Optional[Path]:
 
 def ocr_pages(pdf: PdfSource,
               page_indices: Optional[Iterable[int]] = None,
-              dpi: int = 200) -> list[PageText]:
+              dpi: int = 200,
+              config: Optional[str] = None) -> list[PageText]:
     """OCR the requested pages via Tesseract, after rendering with fitz.
+
+    Args:
+        config: Tesseract CLI config string (e.g. ``"--psm 6 --oem 1"``).
+            ``None`` uses Tesseract defaults.
 
     Returns a list of :class:`PageText` (marked ``needs_ocr=True`` for
     provenance). Empty list on any failure.
@@ -271,7 +276,8 @@ def ocr_pages(pdf: PdfSource,
     results: list[PageText] = []
     for page_num, img in sorted(images.items()):
         try:
-            text = pytesseract.image_to_string(img) or ""
+            kwargs = {"config": config} if config else {}
+            text = pytesseract.image_to_string(img, **kwargs) or ""
         except Exception as e:
             logger.debug(f"ocr failed on page {page_num}: {e}")
             text = ""
