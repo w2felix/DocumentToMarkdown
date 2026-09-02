@@ -527,7 +527,7 @@ class PaperPipeline:
             return None
 
     def _ocr_all_pages(self, pdf_path: Path) -> Optional[List[Dict]]:
-        """Backward-compatible wrapper: OCR every page."""
+        """OCR every page."""
         return self._ocr_pages(pdf_path, None)
 
     # ─── Full Text Assembly ───────────────────────────────────────────────────

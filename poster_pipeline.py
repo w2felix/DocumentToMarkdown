@@ -34,9 +34,9 @@ from anthropic_helpers import first_text
 
 
 class PosterPipeline:
-    """Main pipeline for processing scientific posters with vision analysis
+    """Main pipeline for processing scientific posters with vision analysis.
 
-    Vision AI is now MANDATORY for all processing (figure analysis + text correction)
+    Vision AI is required for figure analysis and text correction.
     """
 
     # Class-level constants
@@ -2090,10 +2090,9 @@ Extracted text:
         scores['template_penalty'] = template_penalty
         scores['consistency_penalty'] = consistency_penalty
 
-        # Quality assessment (updated thresholds)
         if overall >= 8:
             scores['assessment'] = 'Excellent'
-        elif overall >= self.QUALITY_GOOD_THRESHOLD:  # Now 5.5 instead of hardcoded 6
+        elif overall >= self.QUALITY_GOOD_THRESHOLD:
             scores['assessment'] = 'Good'
         elif overall >= 4:
             scores['assessment'] = 'Fair'
@@ -2165,8 +2164,6 @@ Extracted text:
     def extract_sections_and_summary(self, text: str, figures: List[Dict],
                                      structure: Dict = None) -> Tuple[Dict, str]:
         """Extract poster sections and executive summary in a single API call.
-
-        Combines what was previously two separate calls (section extraction + summary generation).
 
         Returns:
             Tuple of (sections_dict, executive_summary_string)
@@ -3015,10 +3012,7 @@ Output format:
 
 
 def main():
-    """Main entry point for enhanced poster processing pipeline
-
-    Vision AI is now MANDATORY for all processing.
-    """
+    """Main entry point for enhanced poster processing pipeline."""
     import argparse
 
     parser = argparse.ArgumentParser(
