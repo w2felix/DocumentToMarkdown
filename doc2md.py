@@ -231,7 +231,7 @@ def _extract_with_paper_pipeline(pdf_path: Path, max_vision_pages: int,
             figure_pages = pipeline.identify_figure_pages(page_data)
             if figure_pages:
                 figures = pipeline.analyze_figures_batch(pdf_path, figure_pages, full_text)
-        tables = pipeline.extract_tables(pdf_path, page_data)
+        tables = pipeline.extract_tables(pdf_path, page_data, full_text=full_text)
 
         # Summary + quality
         summary = "" if no_vision else pipeline.generate_executive_summary(sections, metadata)

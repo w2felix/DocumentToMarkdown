@@ -1266,18 +1266,39 @@ Return ONLY the JSON array."""
 
     # ─── Table Extraction ─────────────────────────────────────────────────────
 
-    def extract_tables(self, pdf_path: Path, page_data: List[Dict]) -> List[Dict]:
-        """Extract tables using pdfplumber's table detection."""
+    def extract_tables(self, pdf_path: Path, page_data: List[Dict],
+                        full_text: Optional[str] = None) -> List[Dict]:
+        """Extract tables using pdfplumber's table detection.
+
+        pdfplumber preserves the visual line breaks of a cell that wraps
+        across multiple lines inside a narrow column (e.g. "Onvanser\\ntib").
+        That's correct for the source layout but fatal to a markdown table:
+        a raw newline inside a `_format_table_markdown` cell splits one row
+        into two, shifting every `|` column boundary for the rest of the
+        table. ``_clean_table_cell`` collapses that back to plain text at
+        the point of extraction, so every downstream consumer of ``tables``
+        gets sane data, not just the markdown renderer.
+
+        ``full_text`` can be passed in by callers that already assembled it
+        (avoids re-joining all page text just to find table captions).
+        """
         import pdfplumber
 
         tables = []
-        table_captions = self._extract_table_captions(
-            self.assemble_full_text(page_data))
+        if full_text is None:
+            full_text = self.assemble_full_text(page_data)
+        table_captions = self._extract_table_captions(full_text)
 
         try:
             with pdfplumber.open(str(pdf_path)) as pdf:
                 for i, page in enumerate(pdf.pages):
-                    page_tables = page.extract_tables()
+                    try:
+                        page_tables = page.extract_tables()
+                    except Exception as e:
+                        # Don't let one malformed page (e.g. a corrupt content
+                        # stream) discard tables already found on other pages.
+                        logger.warning(f"Table extraction failed on page {i + 1}: {e}")
+                        continue
                     if not page_tables:
                         continue
                     for t_idx, table_data in enumerate(page_tables):
@@ -1297,13 +1318,26 @@ Return ONLY the JSON array."""
                             'table_number': table_num,
                             'page': i,
                             'caption': caption,
-                            'header': [str(h) if h else '' for h in header],
-                            'rows': [[str(cell) if cell else '' for cell in row] for row in rows],
+                            'header': [self._clean_table_cell(h) for h in header],
+                            'rows': [[self._clean_table_cell(cell) for cell in row] for row in rows],
                         })
         except Exception as e:
             logger.error(f"Table extraction failed: {e}")
 
         return tables
+
+    @staticmethod
+    def _clean_table_cell(cell: Any) -> str:
+        """Normalize a raw pdfplumber cell value into a single-line string.
+
+        Collapses any whitespace run (including the embedded newlines
+        pdfplumber emits for wrapped multi-line cell text) to a single
+        space, rather than leaving line-wrap artifacts in stored data that
+        every consumer of `extract_tables()` output has to work around.
+        """
+        if not cell:
+            return ''
+        return re.sub(r'\s+', ' ', str(cell)).strip()
 
     def _extract_table_captions(self, full_text: str) -> List[Dict]:
         """Extract table captions from text."""
@@ -1698,8 +1732,8 @@ Write a concise summary highlighting the main finding, method, and significance.
         lines.append(f'### Table {table_num}' + (f': {caption}' if caption else ''))
         lines.append('')
 
-        header = table.get('header', [])
-        rows = table.get('rows', [])
+        header = [self._escape_table_cell(h) for h in table.get('header', [])]
+        rows = [[self._escape_table_cell(cell) for cell in row] for row in table.get('rows', [])]
 
         if header:
             lines.append('| ' + ' | '.join(header) + ' |')
@@ -1709,6 +1743,15 @@ Write a concise summary highlighting the main finding, method, and significance.
                 lines.append('| ' + ' | '.join(padded[:len(header)]) + ' |')
         lines.append('')
         return '\n'.join(lines)
+
+    def _escape_table_cell(self, cell: Any) -> str:
+        """Render a cell value safely inside a `|`-delimited GFM table row.
+
+        Re-applies `_clean_table_cell` defensively (harmless if the value is
+        already clean) and escapes any literal `|`, which would otherwise be
+        read as a column boundary and shift every column to its right.
+        """
+        return self._clean_table_cell(cell).replace('|', '\\|')
 
     def _escape_yaml(self, text: str) -> str:
         """Escape special characters for YAML strings."""
@@ -1839,7 +1882,7 @@ Write a concise summary highlighting the main finding, method, and significance.
             figures = [{'figure_number': c['figure_number'], 'title': c['caption'][:100],
                        'description': c['caption']} for c in text_captions]
 
-        tables = self.extract_tables(pdf_path, page_data)
+        tables = self.extract_tables(pdf_path, page_data, full_text=full_text)
         logger.info(f"  Figures: {len(figures)}, Tables: {len(tables)}")
 
         # Step 6: Executive summary
