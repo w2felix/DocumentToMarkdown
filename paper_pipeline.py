@@ -902,39 +902,100 @@ Use null for fields not visible on this page. Extract the COMPLETE abstract if i
             b_tokens = set(re.split(r"[-\s']+", b)) - {""}
             return bool(a_tokens & b_tokens)
 
+        def _title_matches(cr_title: str) -> bool:
+            """Return True if the Crossref record's title plausibly is the
+            same paper as our own extracted title (same 0.75-Jaccard bar
+            resolve_doi_by_title uses for the title-search path). This is
+            the backstop for the doi-fetch path: a DOI regex-matched off
+            page 1 can belong to a paper cited in the references or a
+            footer, not the paper being ingested, and no author signal may
+            be available to catch that (e.g. text extraction found no
+            author line at all). Returns True -- i.e. does not block -- when
+            either title is missing or too short to compare meaningfully,
+            since that means we have no independent signal to contradict
+            the DOI lookup with."""
+            our_title = _cr.sanitize_title(merged.get('title') or '')
+            if not cr_title or len(our_title) < 10:
+                return True
+            our_tokens = _cr._tokens(our_title)
+            cr_tokens = _cr._tokens(cr_title)
+            if not our_tokens or not cr_tokens:
+                return True
+            jaccard = len(our_tokens & cr_tokens) / len(our_tokens | cr_tokens)
+            return jaccard >= 0.5
+
+        def _record_is_plausible(record: Optional[dict], fname_author: str) -> bool:
+            """Return True unless we have independent evidence `record` is a
+            different paper than the one being ingested. Checks author
+            (when we have a hint) and falls back to title similarity
+            (when we don't, or in addition) -- a DOI regex-matched off
+            page 1 can belong to a citation in the references or a footer,
+            not the paper being ingested, and either signal alone can miss
+            that: no author line was found on page 1 for this exact paper,
+            for instance, but the extracted title still disagreed with the
+            wrong record's title."""
+            if not record:
+                return True
+            cr_first = next(
+                (a for a in record.get('authors', [])
+                 if a.get('sequence') == 'first'),
+                None,
+            ) or (record.get('authors') or [None])[0]
+            cr_family = ((cr_first or {}).get('family') or '')
+            have_author_signal = bool(
+                fname_author and fname_author.lower() not in ('unknown', 'et', 'al')
+                and cr_family
+            )
+            if have_author_signal:
+                # Author signal is available and decisive either way -- an
+                # agreeing author is strong enough evidence on its own, and
+                # skips the title check (whose own text-extraction can be
+                # unreliable, e.g. running headers/URLs bleeding into the
+                # "title" field, which would otherwise false-positive-reject
+                # a genuinely correct match).
+                return _family_matches(cr_family, fname_author)
+            return _title_matches(record.get('title') or '')
+
         try:
             doi = merged.get('doi')
             record = _cr.fetch_by_doi(doi) if doi else None
 
-            # Sanity check: if filename encodes a first-author surname and
-            # Crossref returned a different family, the DOI is probably from
-            # a paper *cited* on page 1, not this paper. Try the title path.
-            fname_author = filename_meta.get('first_author') or ''
-            if record and fname_author:
-                cr_first = next(
-                    (a for a in record.get('authors', [])
-                     if a.get('sequence') == 'first'),
-                    None,
-                ) or (record.get('authors') or [None])[0]
-                cr_family = ((cr_first or {}).get('family') or '')
-                if cr_family and not _family_matches(cr_family, fname_author):
+            # Sanity check: prefer the filename hint (reliable when the
+            # vault's naming convention encodes it), but URL-downloaded
+            # PDFs are always saved as a generic "downloaded.pdf" with no
+            # author in the name, and text extraction sometimes finds no
+            # author line at all -- falling back to the paper's own
+            # vision/text-extracted first author, and to title similarity
+            # when even that is unavailable, means the sanity check still
+            # runs for those paths instead of being silently skipped.
+            fname_author = (filename_meta.get('first_author')
+                            or merged.get('first_author') or '')
+            if record and not _record_is_plausible(record, fname_author):
+                logger.info(
+                    "  Crossref: DOI-fetched record does not match this "
+                    "paper's extracted author/title, retrying via title"
+                )
+                alt = _title_lookup()
+                if alt and _record_is_plausible(alt, fname_author):
+                    record = alt
+                else:
                     logger.info(
-                        f"  Crossref: DOI first-author '{cr_family}' does not "
-                        f"match filename '{fname_author}', retrying via title"
+                        "  Crossref: title fallback returned nothing plausible; "
+                        "discarding mismatched DOI record"
                     )
-                    alt = _title_lookup()
-                    if alt:
-                        record = alt
-                    else:
-                        logger.info(
-                            "  Crossref: title fallback returned nothing; "
-                            "discarding mismatched DOI record"
-                        )
-                        record = None
-                        merged['doi'] = None
+                    record = None
+                    merged['doi'] = None
 
             if not record:
                 record = _title_lookup()
+                if record and not _record_is_plausible(record, fname_author):
+                    logger.info(
+                        "  Crossref: title-search record does not match this "
+                        "paper's extracted author/title; discarding as an "
+                        "unrelated paper"
+                    )
+                    record = None
+
             overrides = _cr.reconcile(text_meta, vision_meta, record)
             if not overrides:
                 return
