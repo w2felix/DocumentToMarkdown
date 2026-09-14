@@ -48,8 +48,9 @@ class CIPipeline:
 
     EXTRACTION_SYSTEM_PROMPT = """You extract pharmaceutical competitive intelligence data from oncology document sections. Covers ADCs, bispecifics, TCEs, checkpoint inhibitors, cell therapies, TLR agonists, cytokines, mAbs, and other oncology modalities.
 Return ONLY valid JSON with this structure:
-{"companies":{"Company Name":{"assets":[{"name":"drug name or code","target":"molecular target or null","payload":"payload type or null","modality":"modality type (ADC/TCE/mAb/BiTE/CAR-T/NK/TLR agonist/cytokine/etc.) or null","indications":["cancer types"],"stage":"Phase I/II/III/Approved/Preclinical or null","key_updates":["concise updates"],"clinical_data":["efficacy/safety data: ORR, PFS, OS, AEs"]}]}},"deals":[{"parties":["Company A","Company B"],"type":"acquisition/licensing/collaboration","details":"brief description"}],"regulatory_events":[{"company":"Name","asset":"drug","event":"FDA approval/Priority Review/IND/filing/etc."}]}
-Rules: Use canonical company names. Include ALL companies mentioned. Capture drug names exactly as written. If clinical data is mentioned, capture it in clinical_data. If nothing found, return {"companies":{},"deals":[],"regulatory_events":[]}."""
+{"companies":{"Company Name":{"assets":[{"name":"drug name or code","target":"molecular target or null","payload":"payload type or null","modality":"modality type (ADC/TCE/mAb/BiTE/CAR-T/NK/TLR agonist/cytokine/etc.) or null","indications":["cancer types"],"stage":"Phase I/II/III/Approved/Preclinical or null","key_updates":[{"text":"concise update","indications":["which of this asset's indications this specific update is about"]}],"clinical_data":["efficacy/safety data: ORR, PFS, OS, AEs"]}]}},"deals":[{"parties":["Company A","Company B"],"type":"acquisition/licensing/collaboration","details":"brief description"}],"regulatory_events":[{"company":"Name","asset":"drug","event":"FDA approval/Priority Review/IND/filing/etc."}]}
+Rules: Use canonical company names. Include ALL companies mentioned. Capture drug names exactly as written. If clinical data is mentioned, capture it in clinical_data. If nothing found, return {"companies":{},"deals":[],"regulatory_events":[]}.
+Each key_update's "indications" array MUST name only the specific indication(s) (from this asset's own indications list) that update is actually about — e.g. a trial result for one tumor type does not belong to that asset's other, unrelated indications. Use an empty indications array ONLY for genuinely asset-wide facts with no single-indication scope (ownership/licensing, manufacturing, overall regulatory designation, financial estimates) — these are cross-indication, not per-indication. When an update genuinely spans multiple indications (e.g. a basket trial, a combination regimen tested across several tumor types), list all of them — do not default to listing every indication the asset has."""
 
     ASSET_CODE_RE = re.compile(r'^[A-Z]{1,5}[-]?\d{2,}', re.IGNORECASE)
 
@@ -285,29 +286,51 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
 
         return None
 
+    # ONCrg publishes one file family per therapeutic stream, and the stream tag
+    # sits between the series name and the period: ONCrgSentinel-<STREAM>-<when>.
+    # Known streams as of 2026-09: ADC, IO-Emerging, DDR.
+    _STREAM_LABELS = {
+        'adc': 'ADC',
+        'io-emerging': 'IO Emerging',
+        'io': 'IO',
+        'ddr': 'DDR',
+        'aml': 'AML',
+    }
+
+    _SERIES_PATTERNS = (
+        # (doc_type, regex over the filename stem, display series name)
+        ('sentinel', r'ONCrgSentinel-(?P<stream>[A-Za-z]+(?:-Emerging)?)-(?P<rest>.+)',
+         'ONCrg Sentinel'),
+        ('conference', r'ONCrgConference-(?P<stream>[A-Za-z]+(?:-Emerging)?)-(?P<rest>.+)',
+         'ONCrg Conference'),
+        ('strategy',
+         r'ONCrgPipeStrategies-(?P<stream>[A-Za-z]+(?:-Emerging)?)-Presentation-(?P<rest>.+)',
+         'ONCrg Pipeline Strategies'),
+    )
+
     def _extract_title_from_filename(self, filepath: Path, doc_type: str) -> str:
-        """Extract a human-readable title from the filename."""
+        """Extract a human-readable title from the filename.
+
+        The stream tag is parsed, not assumed. Each pattern here previously
+        hardcoded `-ADC-`, so every non-ADC stream missed its pattern and fell
+        through to a raw-stem fallback, yielding titles like
+        "ONCrg Sentinel — ONCrgSentinel-IO-Emerging-June-2025" and, worse,
+        an executive summary headed "ONCrg Sentinel ADC" on an IO report.
+        Since those summaries are consumed as a trend corpus, a wrong stream
+        label in the summary text is a data-quality fault, not cosmetics.
+        """
         stem = filepath.stem
 
-        if doc_type == 'sentinel':
-            match = re.search(r'ONCrgSentinel-ADC-(.+)', stem)
+        for want_type, pattern, series in self._SERIES_PATTERNS:
+            if doc_type != want_type:
+                continue
+            match = re.search(pattern, stem, re.IGNORECASE)
             if match:
-                return f"ONCrg Sentinel ADC — {match.group(1).replace('-', ' ')}"
-            return f"ONCrg Sentinel — {stem}"
-
-        if doc_type == 'conference':
-            match = re.search(r'ONCrgConference-ADC-(.+)', stem)
-            if match:
-                parts = match.group(1).replace('-', ' ')
-                return f"ONCrg Conference ADC — {parts}"
-            return f"ONCrg Conference — {stem}"
-
-        if doc_type == 'strategy':
-            match = re.search(r'ONCrgPipeStrategies-ADC-Presentation-(.+)', stem)
-            if match:
-                parts = match.group(1).replace('-', ' ')
-                return f"ONCrg Pipeline Strategies ADC — {parts}"
-            return f"ONCrg Pipeline Strategies — {stem}"
+                stream = match.group('stream')
+                label = self._STREAM_LABELS.get(stream.lower(), stream.replace('-', ' '))
+                rest = match.group('rest').replace('-', ' ').strip()
+                return f"{series} {label} — {rest}" if rest else f"{series} {label}"
+            return f"{series} — {stem}"
 
         # General: clean up the stem
         title = re.sub(r'[-_]+', ' ', stem)
@@ -546,6 +569,46 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
 
         return self._merge_ci_extractions(chunk_results)
 
+    @staticmethod
+    def _as_key_update(update: Any) -> Dict:
+        """Normalize one key_update entry to {"text": str, "indications": [str]}.
+
+        Accepts the current tagged-dict shape produced by EXTRACTION_SYSTEM_PROMPT,
+        and defensively accepts a plain string (the pre-tagging shape, kept only
+        so older cached extractions or a partial rollout don't crash downstream
+        consumers) by treating it as untagged (empty indications, routed to
+        Cross-Indication by consumers rather than guessed).
+        """
+        if isinstance(update, dict):
+            text = str(update.get('text', '')).strip()
+            inds = [str(i).strip() for i in (update.get('indications') or []) if str(i).strip()]
+            return {'text': text, 'indications': inds}
+        return {'text': str(update).strip(), 'indications': []}
+
+    @classmethod
+    def _merge_key_update(cls, existing_asset: Dict, update: Any) -> None:
+        """Append a key_update to an existing asset, merging by text.
+
+        Two chunks (or two overlapping extraction windows) describing the same
+        event should not produce two entries — nor should merging silently drop
+        one chunk's indication tag in favor of the other's. Match on text and
+        union the indication tags.
+        """
+        normalized = cls._as_key_update(update)
+        if not normalized['text']:
+            return
+        updates = existing_asset.setdefault('key_updates', [])
+        for existing_update in updates:
+            existing_update_norm = cls._as_key_update(existing_update)
+            if existing_update_norm['text'] == normalized['text']:
+                for ind in normalized['indications']:
+                    if ind not in existing_update_norm['indications']:
+                        existing_update_norm['indications'].append(ind)
+                existing_update.clear()
+                existing_update.update(existing_update_norm)
+                return
+        updates.append(normalized)
+
     def _merge_ci_extractions(self, chunk_results: List[Dict]) -> Dict:
         """Merge company/asset extractions from multiple chunks."""
         merged_companies = {}
@@ -572,8 +635,7 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
                     if existing:
                         # Merge into existing asset
                         for update in asset.get('key_updates', []):
-                            if update and update not in existing.get('key_updates', []):
-                                existing.setdefault('key_updates', []).append(update)
+                            self._merge_key_update(existing, update)
                         for data in asset.get('clinical_data', []):
                             if data and data not in existing.get('clinical_data', []):
                                 existing.setdefault('clinical_data', []).append(data)
@@ -598,6 +660,12 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
             for event in result.get('regulatory_events', []):
                 if event and not self._is_duplicate_event(merged_regulatory, event):
                     merged_regulatory.append(event)
+
+        for company_data in merged_companies.values():
+            for asset in company_data.get('assets', []):
+                asset['key_updates'] = [
+                    self._as_key_update(u) for u in asset.get('key_updates', []) if u
+                ]
 
         # Build summary lists
         companies_mentioned = sorted(merged_companies.keys())
@@ -715,8 +783,9 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
         for company_data in list(ci_data.get('companies', {}).values())[:15]:
             for asset in company_data.get('assets', [])[:2]:
                 for update in asset.get('key_updates', [])[:1]:
+                    update_text = self._as_key_update(update)['text']
                     summary_input['top_updates'].append(
-                        f"{asset.get('name', '?')}: {update}")
+                        f"{asset.get('name', '?')}: {update_text}")
                 for data in asset.get('clinical_data', [])[:1]:
                     summary_input['top_updates'].append(
                         f"{asset.get('name', '?')} data: {data}")
@@ -724,9 +793,20 @@ Rules: Use canonical company names. Include ALL companies mentioned. Capture dru
 
         payload = json.dumps(summary_input, separators=(',', ':'))
 
-        prompt = f"""Summarize this ADC competitive intelligence for "{title}" ({doc_type}) in 3-5 bullet points.
+        # The prompt must NOT name a therapeutic area. It used to say "this ADC
+        # competitive intelligence" unconditionally, so an IO-Emerging report
+        # (TCEs, CAR-T, cytokines, zero ADCs) came back headed "ONCrg Sentinel
+        # ADC Competitive Intelligence". These summaries are consumed as a trend
+        # corpus, so a wrong domain label inside the summary text is a data
+        # fault that propagates. Let the content speak; `title` already carries
+        # the stream.
+        prompt = f"""Summarize this oncology competitive intelligence report, "{title}" ({doc_type}), in 3-5 bullet points.
 Focus on: most significant developments, clinical data, regulatory decisions, deals.
 Be specific and data-driven (include numbers, company names, drug names).
+Do not add a heading or title line: return only the bullet points.
+Describe only the modalities actually present in the data below. Do not assume
+the report is about antibody-drug conjugates, or any other modality, unless the
+data shows it.
 
 {payload}"""
 
@@ -956,7 +1036,9 @@ Be specific and data-driven (include numbers, company names, drug names).
                     if asset.get('indications'):
                         lines.append(f'- **Indications**: {", ".join(asset["indications"])}')
                     for update in asset.get('key_updates', []):
-                        lines.append(f'- **Update**: {update}')
+                        norm = self._as_key_update(update)
+                        tag = f' [{", ".join(norm["indications"])}]' if norm['indications'] else ' [Cross-Indication]'
+                        lines.append(f'- **Update**: {norm["text"]}{tag}')
                     for data in asset.get('clinical_data', []):
                         lines.append(f'- **Clinical Data**: {data}')
                     lines.append('')
