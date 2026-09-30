@@ -23,6 +23,7 @@ from io import BytesIO
 import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 from pipeline_security import validate_path, validate_output_path, sanitize_filename
 from auth import get_anthropic_client as _get_shared_client
 from anthropic_helpers import first_text
+from pdf_utils import strip_markdown_noise
 
 
 class PaperPipeline:
@@ -49,6 +51,15 @@ class PaperPipeline:
 
     MAX_PDF_SIZE_MB = 200
     DEFAULT_BUDGET_CAP = 50
+
+    # Shared journal-name alternation, used both to find a journal name in
+    # running text (extract_metadata_from_text) and to skip a bare masthead
+    # line before the real title (_extract_title_from_first_page). Kept in
+    # one place instead of duplicating the name list in both call sites.
+    JOURNAL_NAME_ALTERNATION = (
+        r'Nature|Science|Cell|PNAS|The\s+Lancet|BMJ|JAMA|PLoS\s+\w+|'
+        r'Nucleic\s+Acids\s+Research|Bioinformatics|Cancer\s+Research'
+    )
 
     NAMING_SCHEMES = {
         'default': '{first_author}_{year}_{title_slug}',
@@ -580,7 +591,7 @@ class PaperPipeline:
         # often appears in headers/footers on later pages)
         full_search = '\n'.join(p['text'] for p in page_data[:5]) if len(page_data) > 2 else first_pages_text
         journal_patterns = [
-            re.compile(r'(Nature|Science|Cell|PNAS|The Lancet|BMJ|JAMA|PLoS\s+\w+|Nucleic Acids Research|Bioinformatics|Cancer Research|Nature\s+\w+)(?:\s*\||\s+Vol)', re.IGNORECASE),
+            re.compile(rf'({self.JOURNAL_NAME_ALTERNATION}|Nature\s+\w+)(?:\s*\||\s+Vol)', re.IGNORECASE),
             re.compile(r'(?:Published in|Journal:?)\s+([A-Z][A-Za-z\s&]+?)(?:\s*[,|]|\s+\d)', re.IGNORECASE),
         ]
         for jp in journal_patterns:
@@ -592,7 +603,16 @@ class PaperPipeline:
         return metadata
 
     def _extract_title_from_first_page(self, first_page: str) -> Optional[str]:
-        """Extract title from first page text using heuristics."""
+        """Extract title from first page text using heuristics.
+
+        pdf-inspector's markdown output ("## nature machine intelligence",
+        "### Article [...]") defeats these line-start regexes when left as-is
+        -- the leading "#"/"**" shifts what "starts" the line, so a running
+        head that should be skipped gets picked up as the title instead.
+        Stripping markdown noise first makes this backend-agnostic, matching
+        what pdfplumber's plain text already looked like.
+        """
+        first_page = strip_markdown_noise(first_page)
         lines = first_page.split('\n')
         skip_patterns = re.compile(
             r'^(Article|Letter|Review|Report|Research|Original|Open\s+access|'
@@ -600,6 +620,14 @@ class PaperPipeline:
             r'News\s+&\s+Views|Comment|Correspondence|Perspective|Editorial|'
             r'https?://|doi:|Received|Accepted|Published|Check for|©|\d+\s*$)',
             re.IGNORECASE
+        )
+        # A bare journal masthead line (e.g. "nature machine intelligence")
+        # commonly precedes the real title on page 1 and has no other skip
+        # signal (no URL, no "Article" label) -- skip it explicitly rather
+        # than let it get picked up as if it were the title itself.
+        masthead_pattern = re.compile(
+            rf'^(?:{self.JOURNAL_NAME_ALTERNATION})(?:\s+\w+){{0,3}}\s*$',
+            re.IGNORECASE,
         )
 
         title_lines = []
@@ -613,6 +641,8 @@ class PaperPipeline:
             if skip_patterns.match(line):
                 if collecting and title_lines:
                     break
+                continue
+            if not collecting and masthead_pattern.match(line):
                 continue
             if len(line) < 10:
                 if collecting and title_lines:
@@ -652,7 +682,14 @@ class PaperPipeline:
         return None
 
     def _extract_authors_from_first_page(self, first_page: str) -> List[str]:
-        """Extract author names from first page."""
+        """Extract author names from first page.
+
+        See _extract_title_from_first_page for why markdown noise is
+        stripped first: pdf-inspector's "**Bold Name**" runs and heading
+        markers otherwise confuse the CamelCase/comma-structure heuristics
+        below (e.g. a "**" pair spuriously satisfying a name-boundary check).
+        """
+        first_page = strip_markdown_noise(first_page)
         lines = first_page.split('\n')
 
         # Fast path: IEEE/ACM/many journals put authors on the line(s)
@@ -1327,6 +1364,14 @@ Return ONLY the JSON array."""
 
     # ─── Table Extraction ─────────────────────────────────────────────────────
 
+    # pdfplumber's line-based table detector misreads box/arrow architecture
+    # diagrams (common in AI/ML and methods papers) as grid tables: dense
+    # vector-graphic line segments look like ruled table borders to it. That
+    # same misdetection is also the slow case -- extract_tables() measured at
+    # 71s on one such page (vs. 1-4s on a genuine table page). Cap the wall
+    # time per page so one adversarial diagram page can't stall the whole run.
+    _TABLE_EXTRACT_TIMEOUT_S = 15
+
     def extract_tables(self, pdf_path: Path, page_data: List[Dict],
                         full_text: Optional[str] = None) -> List[Dict]:
         """Extract tables using pdfplumber's table detection.
@@ -1342,6 +1387,15 @@ Return ONLY the JSON array."""
 
         ``full_text`` can be passed in by callers that already assembled it
         (avoids re-joining all page text just to find table captions).
+
+        Only scans pages pdf-inspector already flagged as ``pages_with_tables``
+        (via ``self._last_frontend_flags``, set by ``_characterize_pdf_inspector``
+        -- the same flag ``identify_figure_pages`` already uses to skip Vision AI
+        on table-only pages). Falls back to scanning every page when that flag
+        is unavailable (the legacy pdfplumber-only characterization path).
+        Every candidate table is also validated by ``_is_plausible_table``
+        before being kept, as a second line of defense for the fallback case
+        and for any page where pdf-inspector's own flag is itself wrong.
         """
         import pdfplumber
 
@@ -1350,16 +1404,17 @@ Return ONLY the JSON array."""
             full_text = self.assemble_full_text(page_data)
         table_captions = self._extract_table_captions(full_text)
 
+        flags = getattr(self, '_last_frontend_flags', None) or {}
+        candidate_pages = flags.get('pages_with_tables')
+        candidate_pages = set(candidate_pages) if candidate_pages is not None else None
+
         try:
             with pdfplumber.open(str(pdf_path)) as pdf:
                 for i, page in enumerate(pdf.pages):
-                    try:
-                        page_tables = page.extract_tables()
-                    except Exception as e:
-                        # Don't let one malformed page (e.g. a corrupt content
-                        # stream) discard tables already found on other pages.
-                        logger.warning(f"Table extraction failed on page {i + 1}: {e}")
+                    if candidate_pages is not None and i not in candidate_pages:
                         continue
+
+                    page_tables = self._extract_page_tables_with_timeout(page, i)
                     if not page_tables:
                         continue
                     for t_idx, table_data in enumerate(page_tables):
@@ -1367,8 +1422,13 @@ Return ONLY the JSON array."""
                             continue
                         header = table_data[0] if table_data[0] else []
                         rows = table_data[1:]
-                        table_num = len(tables) + 1
 
+                        clean_header = [self._clean_table_cell(h) for h in header]
+                        clean_rows = [[self._clean_table_cell(cell) for cell in row] for row in rows]
+                        if not self._is_plausible_table(clean_header, clean_rows):
+                            continue
+
+                        table_num = len(tables) + 1
                         caption = ""
                         for tc in table_captions:
                             if tc['table_number'] == table_num:
@@ -1379,13 +1439,65 @@ Return ONLY the JSON array."""
                             'table_number': table_num,
                             'page': i,
                             'caption': caption,
-                            'header': [self._clean_table_cell(h) for h in header],
-                            'rows': [[self._clean_table_cell(cell) for cell in row] for row in rows],
+                            'header': clean_header,
+                            'rows': clean_rows,
                         })
         except Exception as e:
             logger.error(f"Table extraction failed: {e}")
 
         return tables
+
+    def _extract_page_tables_with_timeout(self, page, page_index: int) -> list:
+        """Run page.extract_tables() with a wall-clock timeout.
+
+        Returns [] on timeout or error rather than raising, so one
+        adversarial page (dense vector-graphic diagram) can't stall table
+        extraction for the whole document.
+        """
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(page.extract_tables)
+            try:
+                return future.result(timeout=self._TABLE_EXTRACT_TIMEOUT_S) or []
+            except FuturesTimeoutError:
+                logger.warning(
+                    f"Table extraction timed out after {self._TABLE_EXTRACT_TIMEOUT_S}s "
+                    f"on page {page_index + 1} (likely a dense diagram misread as a "
+                    f"table grid) -- skipping tables on this page."
+                )
+                return []
+            except Exception as e:
+                # Don't let one malformed page (e.g. a corrupt content
+                # stream) discard tables already found on other pages.
+                logger.warning(f"Table extraction failed on page {page_index + 1}: {e}")
+                return []
+
+    @staticmethod
+    def _is_plausible_table(header: List[str], rows: List[List[str]]) -> bool:
+        """Reject pdfplumber false positives: diagrams and multi-column text
+        blocks that its line-detection heuristic misreads as grid tables.
+
+        Real data tables have mostly-populated cells with short values.
+        Diagram/byline misdetections tend toward mostly-empty cells, or a
+        handful of cells holding long free-text fragments (a caption or
+        paragraph snippet swept up by the false grid) rather than short
+        tabular values.
+        """
+        all_rows = ([header] if header else []) + rows
+        cells = [c for row in all_rows for c in row]
+        if not cells:
+            return False
+
+        non_empty = [c for c in cells if c and c.strip()]
+        if not non_empty:
+            return False
+        if len(non_empty) / len(cells) < 0.4:
+            return False
+
+        long_cells = [c for c in non_empty if len(c) > 200]
+        if len(long_cells) / len(non_empty) > 0.2:
+            return False
+
+        return True
 
     @staticmethod
     def _clean_table_cell(cell: Any) -> str:

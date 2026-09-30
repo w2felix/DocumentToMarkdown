@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from pdf_utils import strip_markdown_noise
+
 logger = logging.getLogger(__name__)
 
 _CROSSREF_WORKS = "https://api.crossref.org/works"
@@ -36,9 +38,6 @@ _USER_AGENT = "DocumentToMarkdown/1.0 (mailto:felix.geist@merckgroup.com)"
 # nested subdirectory tree.
 _DOI_CLEAN = re.compile(r"[^A-Za-z0-9._\-]")
 
-# Markdown formatting + Unicode replacement char that pdf-inspector sometimes
-# leaves in titles when the source PDF has encoding issues.
-_TITLE_CRUFT = re.compile(r"[\*_`#�]+")
 _TITLE_MIN_CHARS = 10
 
 
@@ -170,7 +169,7 @@ def sanitize_title(title: str) -> str:
     """
     if not title:
         return ""
-    cleaned = _TITLE_CRUFT.sub(" ", title)
+    cleaned = strip_markdown_noise(title)
     return re.sub(r"\s+", " ", cleaned).strip()
 
 

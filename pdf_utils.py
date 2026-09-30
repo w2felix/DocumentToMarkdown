@@ -16,6 +16,7 @@ pages, when to fall back to OCR) stays in the pipeline.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -24,6 +25,28 @@ from typing import Any, Iterable, Optional, Union
 logger = logging.getLogger(__name__)
 
 PdfSource = Union[bytes, str, Path]
+
+# Markdown formatting + Unicode replacement char that pdf-inspector's Rust
+# frontend leaves in ``page.markdown``/``page.text`` (headings, bold names,
+# encoding-issue artifacts). Regex heuristics written against pdfplumber's
+# plain text choke on this: e.g. a line like "## nature machine intelligence"
+# doesn't match a skip-pattern anchored on the bare journal name, so it gets
+# picked up as a title. Shared here (not duplicated per-caller) because it is
+# a backend-swap concern, exactly what this module exists to centralize.
+_MARKDOWN_NOISE_RE = re.compile(r"[\*_`#�]+")
+
+
+def strip_markdown_noise(text: str) -> str:
+    """Collapse markdown formatting characters (#, *, _, `) and the Unicode
+    replacement character to single spaces.
+
+    Safe to call on plain text too (pdfplumber output has none of these
+    characters as structural markup, so nothing changes). Only strips the
+    formatting characters themselves -- link/bracket syntax like
+    ``[text](url)`` is left intact since callers needing DOIs/URLs still
+    want the URL substring searchable.
+    """
+    return _MARKDOWN_NOISE_RE.sub(" ", text)
 
 
 # ── dataclasses ───────────────────────────────────────────────────────────────
