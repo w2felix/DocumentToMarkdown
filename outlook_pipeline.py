@@ -317,8 +317,50 @@ class OutlookPipeline:
             'saved_attachments': saved_attachments,
         }
 
+    def _header_mail(self, mail_item) -> Dict:
+        """Read only the properties needed to group threads and check processed state.
+
+        Body, recipients and attachments are deliberately not touched here: they are
+        the expensive COM calls, and most items in a re-run belong to threads that
+        are skipped. `_snapshot_mail` fetches them later, for changed threads only.
+        """
+        entry_id = ''
+        try:
+            entry_id = mail_item.EntryID
+        except Exception:
+            pass
+
+        subject = ''
+        try:
+            subject = mail_item.Subject or ''
+        except Exception:
+            pass
+
+        received = None
+        try:
+            received = mail_item.ReceivedTime
+        except Exception:
+            pass
+
+        thread_id = ''
+        try:
+            thread_id = mail_item.ConversationID or ''
+        except Exception:
+            pass
+
+        header = {
+            'entry_id': entry_id or f"unknown_{id(mail_item)}",
+            'subject': subject,
+            'received': received,
+            'thread_id': thread_id,
+        }
+        if not entry_id:
+            # Cannot be re-fetched by ID; keep the reference so it can still be snapshotted.
+            header['_item'] = mail_item
+        return header
+
     def _get_mail_items(self, folder) -> List[Dict]:
-        """Retrieve and snapshot mail items from folder."""
+        """Retrieve lightweight headers for mail items in folder (oldest first)."""
         items = folder.Items
         items.Sort("[ReceivedTime]", False)  # oldest first
 
@@ -328,8 +370,7 @@ class OutlookPipeline:
             try:
                 item = items.Item(i)
                 if item.Class == self.OL_MAIL_ITEM:
-                    snapshot = self._snapshot_mail(item)
-                    mail_items.append(snapshot)
+                    mail_items.append(self._header_mail(item))
                     if self.limit and len(mail_items) >= self.limit:
                         break
             except Exception as e:
@@ -338,6 +379,16 @@ class OutlookPipeline:
 
         logger.info(f"Found {len(mail_items)} emails in folder '{self.folder_path}'")
         return mail_items
+
+    def _snapshot_thread(self, headers: List[Dict]) -> List[Dict]:
+        """Full snapshots for every email in a thread, in header order."""
+        snaps = []
+        for h in headers:
+            item = h.get('_item')
+            if item is None:
+                item = self._namespace.GetItemFromID(h['entry_id'], self._store_id)
+            snaps.append(self._snapshot_mail(item))
+        return snaps
 
     def _get_thread_id_from_snapshot(self, snap: Dict) -> str:
         """Get thread identifier from a snapshot dict."""
@@ -1512,9 +1563,11 @@ class OutlookPipeline:
         """Main entry point: connect, snapshot all emails, then process threads."""
         logger.info(f"Connecting to Outlook...")
         namespace = self._connect_outlook()
+        self._namespace = namespace
 
         logger.info(f"Navigating to folder: {self.folder_path}")
         folder = self._navigate_to_folder(namespace, self.folder_path)
+        self._store_id = folder.StoreID
 
         logger.info(f"Retrieving emails...")
         mail_items = self._get_mail_items(folder)
@@ -1529,24 +1582,27 @@ class OutlookPipeline:
         fail_count = 0
         skip_count = 0
 
-        for thread_id, emails in threads.items():
+        for thread_id, headers in threads.items():
             if not self.reprocess:
                 all_processed = all(
-                    self._is_processed(snap['entry_id']) for snap in emails
+                    self._is_processed(h['entry_id']) for h in headers
                 )
                 if all_processed:
                     skip_count += 1
                     continue
 
+            emails = []
             try:
+                # Full snapshot (body, recipients, attachments) only for changed threads.
+                emails = self._snapshot_thread(headers)
                 if self.process_thread(thread_id, emails):
                     success_count += 1
                 else:
                     fail_count += 1
             except Exception as e:
-                subject = emails[-1]['subject'] if emails else 'unknown'
+                subject = headers[-1]['subject'] if headers else 'unknown'
                 logger.error(f"Failed to process thread '{subject}': {e}")
-                self._log_processing(subject or 'unknown', len(emails), 0, 'FAILED')
+                self._log_processing(subject or 'unknown', len(headers), 0, 'FAILED')
                 fail_count += 1
 
         self._save_state()
