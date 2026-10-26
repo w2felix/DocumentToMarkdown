@@ -603,8 +603,14 @@ class OutlookPipeline:
 
         return fallback_name
 
-    def _strip_signoff_from_signature(self, sig: str) -> str:
-        """Remove the greeting/sign-off lines from the beginning of a signature."""
+    def _strip_signoff_from_signature(self, sig: str, sender_name: str = '') -> str:
+        """Remove the greeting/sign-off lines from the beginning of a signature.
+
+        With sender_name, only lines that are the sender's own name are skipped after the
+        greeting. Without it, any short capitalised line is skipped, which also eats the
+        role line ('Scientific Director') that follows the name.
+        """
+        name_toks = self._name_tokens(sender_name)
         lines = sig.split('\n')
         start = 0
         found_signoff = False
@@ -627,6 +633,10 @@ class OutlookPipeline:
             # already known from sender_name and will be re-captured by the parser.
             if found_signoff and stripped[0].isupper() and len(stripped) < 50 and \
                     not any(c in stripped for c in ('@', '+', '|', '.')):
+                if name_toks:
+                    line_toks = self._name_tokens(stripped)
+                    if not line_toks or not line_toks <= name_toks:
+                        break
                 start = i + 1
                 continue
             break
@@ -1050,6 +1060,78 @@ class OutlookPipeline:
         re.IGNORECASE
     )
 
+    # Free-text lines that are never part of the contact block (P.S. remarks, mobile footers).
+    _CTX_NOISE_RE = re.compile(
+        r'^(?:(?:P\.?S\.?|PPS|N\.?B\.?)(?:\s|:)|sent from|get outlook|'
+        r'this (?:e-?mail|message)|diese (?:e-?mail|nachricht))',
+        re.IGNORECASE
+    )
+    _CTX_BARE_DOMAIN_RE = re.compile(
+        r'^[\w\-]+(?:\.[\w\-]+)*\.(?:com|org|net|de|io|bio|eu|edu|co\.uk)$', re.IGNORECASE
+    )
+    _CTX_ROLE_RE = re.compile(
+        r'\b(?:director|manager|scientist|head|lead|leader|principal|senior|junior|associate|'
+        r'officer|engineer|analyst|professor|postdoc|researcher|consultant|specialist|'
+        r'president|vp|ceo|cto|cso|cmo|coo|cfo|founder|partner|chief|coordinator|'
+        r'representative|executive|advisor|adviser|fellow|student|intern|technician|'
+        r'biologist|chemist|pathologist|physician|statistician|bioinformatician|architect|'
+        r'developer|strategist|leiter(?:in)?|leitung|direktor(?:in)?|gesch[aä]ftsf[uü]hrer(?:in)?|'
+        r'referent(?:in)?|wissenschaftler(?:in)?|mitarbeiter(?:in)?)\b',
+        re.IGNORECASE
+    )
+    _CTX_ORG_RE = re.compile(
+        r'\b(?:merck|kgaa|gmbh|ag|inc|ltd|llc|corp|plc|co\.|life sciences|therapeutics|'
+        r'pharma\w*|biopharma|biotech\w*|universit\w+|institut\w*|hospital|laborator\w+|labs?)\b',
+        re.IGNORECASE
+    )
+    _CTX_STREET_RE = re.compile(
+        r'(?:str\.|\b(?:strasse|stra[sß]e|street|avenue|ave|road|platz|weg|allee|boulevard|blvd|'
+        r'suite|floor)\b)', re.IGNORECASE
+    )
+    # Academic titles and degrees: not part of a name match, not content on their own.
+    _CTX_HONORIFICS = {'dr', 'prof', 'phd', 'md', 'msc', 'mba', 'dipl', 'ing', 'mr', 'mrs',
+                       'ms', 'mag', 'dphil', 'pharmd', 'jr', 'sr'}
+
+    @staticmethod
+    def _fold(text: str) -> str:
+        """Lowercase and transliterate so 'Knühl' and 'Knuehl' compare equal."""
+        import unicodedata
+        for src, dst in (('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss'),
+                         ('Ä', 'ae'), ('Ö', 'oe'), ('Ü', 'ue')):
+            text = text.replace(src, dst)
+        text = unicodedata.normalize('NFKD', text)
+        return ''.join(c for c in text if not unicodedata.combining(c)).lower()
+
+    def _name_tokens(self, text: str) -> Set[str]:
+        """Letter-only tokens of a name, minus titles and degrees."""
+        if not text or '@' in text:
+            return set()
+        return {t for t in re.findall(r'[^\W\d_]+', self._fold(text))
+                if t not in self._CTX_HONORIFICS}
+
+    def _strip_name(self, seg: str, name_toks: Set[str]) -> str:
+        """Remove the signature owner's name from a segment.
+
+        Returns '' for a pure name line ('Dr. Manon Simard', 'Christine', 'Laurie Comfort,
+        CA-AM') and the remainder when real content follows the name ('Jane Doe, Head of X').
+        Segments that do not contain the name are returned unchanged.
+        """
+        toks = self._name_tokens(seg)
+        if not toks:
+            return ''
+        if toks <= name_toks:
+            return ''
+        if not name_toks <= toks:
+            return seg
+        kept = [w for w in seg.replace(',', ' ').split()
+                if self._fold(w.strip('.;:()')) not in name_toks
+                and self._fold(w.strip('.;:()')) not in self._CTX_HONORIFICS]
+        rest = ' '.join(kept)
+        # Credentials like 'CA-AM' are not content; a real role has a word of 5+ letters.
+        if any(len(re.sub(r'[^A-Za-z]', '', w)) >= 5 for w in kept):
+            return rest
+        return ''
+
     # Fields whose changes are tracked in the history.
     _TRACKED_CONTACT_FIELDS = ('title', 'department', 'organization', 'location',
                                'email', 'phone', 'mobile')
@@ -1105,53 +1187,58 @@ class OutlookPipeline:
                     contact['email'] = line
                 continue
 
-            # Website (only when the line is just a URL)
+            # Website (only when the line is just a URL or bare domain)
             m = self._CTX_WEB_RE.search(line)
             if m and len(line.split()) <= 3 and 'website' not in contact:
                 url = re.sub(r'^https?://', '', m.group(0)).rstrip('/')
                 contact['website'] = url
                 continue
-
-            # Skip lone first-name line (matches sender's given name)
-            given = (sender_name or '').split()[0] if sender_name else ''
-            if given and line == given:
-                continue
-            # Skip duplicate full-name line
-            if sender_name and line == sender_name:
+            if self._CTX_BARE_DOMAIN_RE.match(line) and 'website' not in contact:
+                contact['website'] = line
                 continue
 
             structural.append(line)
 
-        # Map remaining structural lines to name/title/department/organization/location
+        # Classify each remaining segment by content. Position in the signature is not
+        # reliable: a P.S. line, the owner's own name, or a missing role line shifts every
+        # later line into the wrong field.
+        name_toks = self._name_tokens(sender_name)
+        loc_parts: List[str] = []
+        dept_lines: List[str] = []
+
         for line in structural:
-            # Location: has postcode or country
-            if self._CTX_ADDR_RE.search(line) and 'location' not in contact:
-                loc = re.sub(r'\bPostcode\s*[:\|]\s*\S+\s*', '', line, flags=re.IGNORECASE)
-                loc = re.sub(r'\s*\|\s*', ', ', loc).strip().strip(',').strip()
-                contact['location'] = loc
-                continue
+            dept_parts: List[str] = []
+            for seg in re.split(r'\s*\|\s*', line):
+                seg = seg.strip(' ,;')
+                if not seg or self._CTX_NOISE_RE.match(seg):
+                    continue
+                # Long sentences are remarks, not contact fields
+                if len(seg.split()) > 10:
+                    continue
+                # Internal mail stop ("Postcode: A025/301"), not a postal address
+                if re.match(r'^post(?:code|fach)\b', seg, re.IGNORECASE):
+                    continue
+                if name_toks:
+                    seg = self._strip_name(seg, name_toks)
+                    if not seg:
+                        continue
 
-            # Pipe-separated line starting with a short company name: "Merck | Street..."
-            if '|' in line:
-                parts = [p.strip() for p in line.split('|')]
-                first = parts[0]
-                if (len(first) < 40 and
-                        re.match(r'^[A-ZÄÖÜ][a-zA-ZäöüÄÖÜ\s\.\-&]+$', first) and
-                        'organization' not in contact):
-                    contact['organization'] = first
-                    addr_parts = [p for p in parts[1:]
-                                  if p and not re.match(r'^Postcode', p, re.IGNORECASE)]
-                    if addr_parts and 'location' not in contact:
-                        contact['location'] = ', '.join(addr_parts)
-                elif 'department' not in contact:
-                    contact['department'] = line
-                continue
+                if (self._CTX_ADDR_RE.search(seg) or
+                        (self._CTX_STREET_RE.search(seg) and re.search(r'\d', seg))):
+                    loc_parts.append(seg)
+                elif 'title' not in contact and self._CTX_ROLE_RE.search(seg):
+                    contact['title'] = seg
+                elif 'organization' not in contact and self._CTX_ORG_RE.search(seg):
+                    contact['organization'] = seg
+                else:
+                    dept_parts.append(seg)
+            if dept_parts:
+                dept_lines.append(' | '.join(dept_parts))
 
-            # Assign in order: title → department → organization
-            for field in ('title', 'department', 'organization'):
-                if field not in contact:
-                    contact[field] = line
-                    break
+        if loc_parts:
+            contact['location'] = ', '.join(loc_parts)
+        if dept_lines:
+            contact['department'] = ' | '.join(dept_lines)
 
         return {k: v for k, v in contact.items() if v}
 
@@ -1427,7 +1514,7 @@ class OutlookPipeline:
             lines.append('')
 
             if sig:
-                clean_sig = self._strip_signoff_from_signature(sig)
+                clean_sig = self._strip_signoff_from_signature(sig, sender_name)
                 if clean_sig and clean_sig not in seen_sigs:
                     seen_sigs.add(clean_sig)
                     email_date = (snap['received'].strftime('%Y-%m-%d')
