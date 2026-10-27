@@ -2,7 +2,7 @@
 
 Automated extraction and analysis of scientific conference talk slides (PDF screenshots) using AI-powered vision processing. Converts multi-slide presentation PDFs into structured, searchable markdown with comprehensive slide content extraction, executive summaries, and metadata integration.
 
-**Powered by Claude Vision AI (Sonnet 4.6)** with OCR pre-pass for high-accuracy text extraction from slide screenshots.
+**Powered by Claude Vision AI (newest Sonnet on your endpoint)** with OCR pre-pass for high-accuracy text extraction from slide screenshots.
 
 ---
 
@@ -233,7 +233,7 @@ abstract_number: 12345
 abstract_url: "https://www.abstractsonline.com/..."
 start_time: "4/17/2026 10:00:00 AM"
 processing_date: 2026-04-29
-vision_model: claude-sonnet-4-6
+vision_model: claude-sonnet-5-5
 quality_overall: 8.4/10
 quality_assessment: Excellent
 ---

@@ -2,7 +2,7 @@
 
 Automated extraction and structuring of corporate and scientific presentations (PPTX + PDF) into searchable markdown. Handles slide decks, meeting materials, agendas, and scientific presentations with native text extraction — no OCR needed.
 
-**Powered by Claude Vision AI (Sonnet 4.6)** for figure analysis, chemical structure detection, and executive summary generation. Vision AI is optional (`--no-vision` for text-only mode).
+**Powered by Claude Vision AI (newest Sonnet on your endpoint)** for figure analysis, chemical structure detection, and executive summary generation. Vision AI is optional (`--no-vision` for text-only mode).
 
 ---
 
@@ -325,7 +325,7 @@ has_chemical_structures: false
 has_action_items: true
 has_summary: true
 extraction_method: native_text+vision_enrichment
-vision_model: claude-sonnet-4-6
+vision_model: claude-sonnet-5-5
 processing_date: 2026-05-12
 quality_overall: 8.3/10
 quality_assessment: Excellent

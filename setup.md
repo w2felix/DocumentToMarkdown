@@ -107,6 +107,8 @@ All three pipelines use the Anthropic API (Claude) for vision analysis. Set cred
 
 **IMPORTANT**: Restart your terminal after setting variables.
 
+**Models:** you don't pick one. The pipelines use the newest Sonnet (vision) and Haiku (CI summaries) your endpoint lists, resolved on the first API call. To pin a version, set `VISION_MODEL` and/or `SUMMARY_MODEL`.
+
 Alternatively, if using the Anthropic API directly (no proxy), set `ANTHROPIC_API_KEY` instead:
 
 ```powershell

@@ -2,7 +2,7 @@
 
 Automated extraction and analysis of pharmaceutical/chemical patent PDFs using selective Vision AI processing. Converts multi-page patent documents (50–300+ pages) into structured, searchable markdown with claims parsing, chemical structure extraction, biological data, and figure analysis.
 
-**Powered by Claude Vision AI (Sonnet 4.6)** with selective page processing — only cover pages and figure/drawing pages use Vision AI; all text-heavy pages use native extraction via pdfplumber with automatic quality assessment and selective Vision AI re-extraction for garbled pages.
+**Powered by Claude Vision AI (newest Sonnet on your endpoint)** with selective page processing — only cover pages and figure/drawing pages use Vision AI; all text-heavy pages use native extraction via pdfplumber with automatic quality assessment and selective Vision AI re-extraction for garbled pages.
 
 **Hybrid OCR** — scanned/image-only patents use Tesseract (local, free) for bulk text extraction, reserving Vision AI only for quality remediation of garbled pages. Reduces API costs by 85–95% while achieving 100% text page coverage.
 
@@ -403,7 +403,7 @@ independent_claims: 7
 extraction_method: native_vision_enhanced
 ocr_engine: tesseract_hybrid
 tesseract_pages: 287
-vision_model: claude-sonnet-4-6
+vision_model: claude-sonnet-5-5
 processing_date: 2026-05-08
 figure_pages_analyzed: 23
 text_pages_enhanced: 5
@@ -552,7 +552,7 @@ Full text of independent claims with category labels...
 ## Processing Metadata
 
 - **Extraction Method**: native_vision_enhanced
-- **Vision Model**: claude-sonnet-4-6
+- **Vision Model**: claude-sonnet-5-5
 - **Total Pages**: 228
 - **Figure Pages Analyzed**: 23
 - **Text Pages Vision-Enhanced**: 5

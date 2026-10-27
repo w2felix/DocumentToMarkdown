@@ -2,7 +2,7 @@
 
 Automated extraction and analysis of scientific conference posters (PDF) using AI-powered vision processing. Converts single-page poster PDFs into structured, searchable markdown with comprehensive figure analysis, quality assessment, and metadata integration.
 
-**Powered by Claude Vision AI (Sonnet 4.6)** with mandatory RAG enhancement for high-accuracy text extraction from complex multi-column poster layouts.
+**Powered by Claude Vision AI (newest Sonnet on your endpoint)** with mandatory RAG enhancement for high-accuracy text extraction from complex multi-column poster layouts.
 
 ---
 
@@ -327,7 +327,7 @@ session_start: "4/19/2026 2:00:00 PM"
 session_end: "4/19/2026 5:00:00 PM"
 location: Section 40
 extraction_method: native_vision_enhanced
-vision_model: claude-sonnet-4-6
+vision_model: claude-sonnet-5-5
 processing_date: 2026-04-21
 quality_overall: 8.5/10
 quality_assessment: Excellent
@@ -407,7 +407,7 @@ Complete extracted text for reference...
 
 ## Processing Metadata
 - **Extraction Method**: native_vision_enhanced
-- **Vision Model**: claude-sonnet-4-6
+- **Vision Model**: claude-sonnet-5-5
 - **Number of Figures**: 5
   - With detailed analysis: 5
 - **Text Length**: 8,432 characters, 1,245 words

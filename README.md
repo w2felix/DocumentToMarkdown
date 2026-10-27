@@ -263,4 +263,8 @@ output_outlook/
 - Anthropic API access (newest Claude Sonnet on the endpoint)
 - Windows (uses Windows Registry for credential loading; Outlook COM requires Windows)
 
+### Model selection
+
+Pipelines use the newest Claude Sonnet your endpoint lists for vision work, and the newest Haiku for CI summaries. The lookup runs once per process on the first API call, so no model IDs need updating when a new version ships. Override with the `VISION_MODEL` or `SUMMARY_MODEL` environment variable. If the endpoint's model list can't be read, a warning is printed and built-in fallback IDs are used. The model actually used is written to each output file's `vision_model:` frontmatter field.
+
 > **Note**: `paper_pipeline.py` and `ci_pipeline.py` do not yet have dedicated README files — see inline `--help` for their CLI options.
