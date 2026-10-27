@@ -260,7 +260,7 @@ output_outlook/
 - pyyaml (outlook pipeline — contact book YAML read/write; usually pre-installed with conda)
 - Microsoft PowerPoint (optional — enables Vision AI for PPTX slide rendering)
 - Microsoft Outlook (outlook pipeline — must be running; no OAuth/admin required)
-- Anthropic API access (Claude Sonnet 4.6)
+- Anthropic API access (newest Claude Sonnet on the endpoint)
 - Windows (uses Windows Registry for credential loading; Outlook COM requires Windows)
 
 > **Note**: `paper_pipeline.py` and `ci_pipeline.py` do not yet have dedicated README files — see inline `--help` for their CLI options.

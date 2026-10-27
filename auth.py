@@ -1,7 +1,9 @@
 """Shared Anthropic credential loading for DocumentToMarkdown pipelines."""
 
 import os
+import re
 import sys
+import threading
 
 from pipeline_security import validate_base_url
 
@@ -73,3 +75,64 @@ def get_anthropic_client():
     else:
         raise RuntimeError("No Anthropic credentials found.")
     return _anthropic_client
+
+
+# ── Model selection ───────────────────────────────────────────────────────────
+# Newest Sonnet / Haiku the endpoint exposes, resolved once per process on first
+# use. An env var (VISION_MODEL / SUMMARY_MODEL) overrides; the literals below
+# apply only when the endpoint's model list can't be read.
+
+_FALLBACK_MODELS = {"sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"}
+
+# claude-sonnet-5-5, claude-sonnet-5, claude-haiku-4-5-20251001, ...
+_MODEL_ID_RE = re.compile(r"^claude-(sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-(\d{8}))?$")
+
+_resolved_models = {}
+_resolve_lock = threading.Lock()
+
+
+def latest_models(model_ids):
+    """Pick the highest-versioned model ID per family ('sonnet', 'haiku')."""
+    best = {}
+    for model_id in model_ids:
+        m = _MODEL_ID_RE.match(model_id)
+        if not m:
+            continue
+        family, major, minor, date = m.groups()
+        key = (int(major), int(minor or 0), date or "")
+        if family not in best or key > best[family][0]:
+            best[family] = (key, model_id)
+    return {family: model_id for family, (_, model_id) in best.items()}
+
+
+def _resolve_models():
+    with _resolve_lock:
+        if _resolved_models:
+            return _resolved_models
+        found = {}
+        try:
+            client = get_anthropic_client().with_options(timeout=10.0, max_retries=1)
+            found = latest_models(m.id for m in client.models.list(limit=1000))
+        except Exception as e:
+            print(f"  [!] Could not list models from endpoint ({e}); using fallback model IDs")
+        for family, fallback in _FALLBACK_MODELS.items():
+            _resolved_models[family] = found.get(family) or fallback
+        return _resolved_models
+
+
+def get_model(family, env_var=None):
+    """Return the model ID for 'sonnet' or 'haiku' (env_var override first)."""
+    return (env_var and os.environ.get(env_var)) or _resolve_models()[family]
+
+
+class LazyModel:
+    """Class attribute that resolves to a model ID on first access, so the
+    network lookup never runs at import time. Behaves like a plain string
+    attribute for `self.VISION_MODEL` / `Pipeline.VISION_MODEL` readers."""
+
+    def __init__(self, family, env_var):
+        self.family = family
+        self.env_var = env_var
+
+    def __get__(self, obj, objtype=None):
+        return get_model(self.family, self.env_var)

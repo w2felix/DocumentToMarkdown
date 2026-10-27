@@ -892,7 +892,7 @@ class OutlookPipeline:
             import base64
             from io import BytesIO
             import pdf_utils
-            from auth import get_anthropic_client
+            from auth import get_anthropic_client, get_model
 
             rendered = pdf_utils.render_pages(file_path, dpi=100)
             images_b64 = []
@@ -927,7 +927,7 @@ class OutlookPipeline:
             })
 
             response = client.messages.create(
-                model="claude-sonnet-4-6",
+                model=get_model("sonnet", "VISION_MODEL"),
                 max_tokens=4000,
                 messages=[{"role": "user", "content": content}]
             )

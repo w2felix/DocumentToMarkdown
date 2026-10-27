@@ -24,7 +24,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-from auth import get_anthropic_client
+from auth import get_anthropic_client, LazyModel
 from anthropic_helpers import first_text
 from pipeline_security import validate_path, validate_output_path, sanitize_filename, check_pptx_safe
 
@@ -32,8 +32,8 @@ from pipeline_security import validate_path, validate_output_path, sanitize_file
 class CIPipeline:
     """Pipeline for processing competitive intelligence documents into structured markdown."""
 
-    VISION_MODEL = "claude-sonnet-4-6"
-    SUMMARY_MODEL = "claude-haiku-4-5-20251001"  # formatting only, not extraction
+    VISION_MODEL = LazyModel("sonnet", "VISION_MODEL")
+    SUMMARY_MODEL = LazyModel("haiku", "SUMMARY_MODEL")  # formatting only, not extraction
     MAX_FILE_SIZE_MB = 500
 
     DEFAULT_BUDGET_CAP = 30

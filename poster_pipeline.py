@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Load credentials and shared auth
 from pipeline_security import validate_path, validate_output_path, check_excel_safe, sanitize_filename
-from auth import get_anthropic_client as _get_shared_client
+from auth import get_anthropic_client as _get_shared_client, LazyModel
 from anthropic_helpers import first_text
 
 
@@ -40,7 +40,7 @@ class PosterPipeline:
     """
 
     # Class-level constants
-    VISION_MODEL = "claude-sonnet-4-6"
+    VISION_MODEL = LazyModel("sonnet", "VISION_MODEL")
     MAX_PARALLEL_FIGURE_WORKERS = 5
     MIN_TEXT_LENGTH_THRESHOLD = 100
     MIN_SECTION_LENGTH = 50

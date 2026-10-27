@@ -26,14 +26,14 @@ logger = logging.getLogger(__name__)
 
 # Load credentials and shared auth
 from pipeline_security import validate_path, validate_output_path, check_pptx_safe, sanitize_filename
-from auth import get_anthropic_client as _get_shared_client
+from auth import get_anthropic_client as _get_shared_client, LazyModel
 from anthropic_helpers import first_text
 
 
 class PresentationPipeline:
     """Pipeline for processing PPTX/PDF presentations into structured markdown."""
 
-    VISION_MODEL = "claude-sonnet-4-6"
+    VISION_MODEL = LazyModel("sonnet", "VISION_MODEL")
     SLIDES_PER_BATCH = 5
     MAX_CONCURRENT_BATCHES = 5
     RENDER_DPI = 150

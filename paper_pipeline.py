@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 from pipeline_security import validate_path, validate_output_path, sanitize_filename
-from auth import get_anthropic_client as _get_shared_client
+from auth import get_anthropic_client as _get_shared_client, LazyModel
 from anthropic_helpers import first_text
 from pdf_utils import strip_markdown_noise
 
@@ -37,7 +37,7 @@ from pdf_utils import strip_markdown_noise
 class PaperPipeline:
     """Pipeline for processing scientific paper PDFs into structured markdown"""
 
-    VISION_MODEL = "claude-sonnet-4-6"
+    VISION_MODEL = LazyModel("sonnet", "VISION_MODEL")
     PAGES_PER_VISION_BATCH = 4
     RENDER_DPI = 200
     MAX_IMAGE_DIMENSION = 1568

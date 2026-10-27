@@ -29,14 +29,14 @@ logger = logging.getLogger(__name__)
 
 # Load credentials and shared auth
 from pipeline_security import validate_path, validate_output_path, sanitize_filename
-from auth import get_anthropic_client as _get_shared_client
+from auth import get_anthropic_client as _get_shared_client, LazyModel
 from anthropic_helpers import first_text
 
 
 class PatentPipeline:
     """Pipeline for processing pharmaceutical patent PDFs into structured markdown"""
 
-    VISION_MODEL = "claude-sonnet-4-6"
+    VISION_MODEL = LazyModel("sonnet", "VISION_MODEL")
     PAGES_PER_VISION_BATCH = 4
     MAX_CONCURRENT_BATCHES = 3
     RENDER_DPI = 200
